@@ -15,6 +15,14 @@ Rewrite of the Rust version (~/dev/tawny/), taking a lazy catch-up (deferred syn
 - No trailing underscore on members for now (may revisit)
 - No mandatory `this->` (may revisit)
 
+## Literals
+- Hex literals use **uppercase** digits: `0xFF`, `0x3489`, not `0xff`
+- Keep the `0x` prefix lowercase
+
+## Initialization
+- Use **uniform initialization** (braces) everywhere: `int x{};`, `Foo bar{a, b};`, `M6502 cpu{DormannCpuConfig{mem}};`
+- Prevents narrowing conversions, works consistently across all types (aggregates, constructors, default init)
+
 ## Brace style
 One true brace style (K&R variant): opening brace on same line for control flow, classes, structs, namespaces, lambdas, etc. **Function definitions** are the exception — their opening brace goes on a new line.
 

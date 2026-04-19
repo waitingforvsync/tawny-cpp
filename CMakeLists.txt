@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(tawny LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -33,13 +33,14 @@ target_include_directories(doctest INTERFACE extern/doctest/include)
 
 # --- Tawny executable -------------------------------------------------------
 
-file(GLOB_RECURSE TAWNY_SOURCES src/*.cpp)
-file(GLOB_RECURSE TEST_SOURCES  test/*.cpp)
+file(GLOB_RECURSE TAWNY_SOURCES src/*.cpp src/*.h)
+file(GLOB_RECURSE TEST_SOURCES  test/*.cpp test/*.h)
 
 add_executable(tawny ${TAWNY_SOURCES} ${TEST_SOURCES})
 
 target_include_directories(tawny PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/test
 )
 
 target_link_libraries(tawny PRIVATE glfw glad doctest)
