@@ -10,6 +10,8 @@
 // at runtime by copying from code. Copy these bytes to load_addr in
 // an otherwise-zeroed 64K address space and begin execution at entry_addr.
 
+#pragma once
+
 #include <cstdint>
 
 namespace tawny::dormann {

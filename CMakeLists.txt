@@ -45,11 +45,6 @@ target_include_directories(tawny PRIVATE
 
 target_link_libraries(tawny PRIVATE glfw glad doctest)
 
-# In release builds, strip out test code entirely.
-target_compile_definitions(tawny PRIVATE
-    $<$<CONFIG:Release>:DOCTEST_CONFIG_DISABLE>
-)
-
 # --- Post-build: run tests ---------------------------------------------------
 
 add_custom_command(TARGET tawny POST_BUILD
