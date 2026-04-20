@@ -98,6 +98,19 @@ namespace detail {
     p = static_cast<std::uint8_t>(on ? (p | bit) : (p & ~bit));
 }
 
+// Lightweight "register view" passed to op classes in place of the whole
+// M6502 reference. Holds references to run_until's register locals so that
+// ops like `Lda::apply(v) { c.a = v; set_nz(c.p, v); }` mutate the locals,
+// not the struct fields. Op classes stay template-generic on C and continue
+// to work whether called with an M6502 reference or this view.
+struct RegView {
+    std::uint8_t &a;
+    std::uint8_t &x;
+    std::uint8_t &y;
+    std::uint8_t &s;
+    std::uint8_t &p;
+};
+
 // Op classes — small structs providing the per-mnemonic transform. Reused
 // across addressing-mode macros. All methods templated on the CPU type so
 // they compose with the templated M6502<Config>.
@@ -322,13 +335,13 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 // Shorthand: set the next phi2 to a stack access at the current S, then run
 // the standard step tail. Used all over BRK/JSR/RTS/RTI/PHA/PHP/PLA/PLP.
 #define TAWNY_NEXT_STACK(NEXT_TST)                                            \
-    addr = static_cast<std::uint16_t>(0x0100u | this->s);                     \
-    TAWNY_STEP_TAIL(access_cost_stack(this->s), (NEXT_TST))
+    addr = static_cast<std::uint16_t>(0x0100u | s);                     \
+    TAWNY_STEP_TAIL(access_cost_stack(s), (NEXT_TST))
 
 // Shorthand: set the next phi2 to an opcode fetch at PC, then run the tail.
 // (Used at the end of every penultimate step.)
 #define TAWNY_NEXT_OPCODE_FETCH(NEXT_TST)                                     \
-    addr = this->pc;                                                          \
+    addr = pc;                                                          \
     TAWNY_STEP_TAIL(access_cost_opcode(addr), (NEXT_TST))
 
 // FETCH_OPCODE_CASE — the last step of every instruction. Reads the next
@@ -338,11 +351,11 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_FETCH_OPCODE_CASE(OPCODE, STEP)                              \
     case ((OPCODE) << 3) | (STEP): {                                       \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         tst  = static_cast<std::uint16_t>(                                 \
                    static_cast<std::uint16_t>(config.read_opcode(addr))    \
                    << 3);                                                  \
-        addr = this->pc;                                                   \
+        addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), tst);                           \
         break;                                                             \
     }
@@ -353,7 +366,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 #define TAWNY_IMPLIED(OPCODE, OP_CLASS)                                    \
     case ((OPCODE) << 3) | 0: {                                            \
         (void)config.read(addr);                                           \
-        OP_CLASS::apply(*this);                                            \
+        OP_CLASS::apply(view);                                            \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -364,8 +377,8 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_IMM_READ(OPCODE, OP_CLASS)                                   \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
-        OP_CLASS::apply(*this, config.read(addr));                         \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
+        OP_CLASS::apply(view, config.read(addr));                         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -378,14 +391,14 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_ZP_READ(OPCODE, OP_CLASS)                                    \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         addr = config.read(addr);                                          \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 1);                              \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        OP_CLASS::apply(*this,                                             \
+        OP_CLASS::apply(view,                                             \
             config.read_zp(static_cast<std::uint8_t>(addr)));              \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                      \
     }                                                                      \
@@ -399,7 +412,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_ZP_WRITE(OPCODE, OP_CLASS)                                   \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         addr = config.read(addr);                                          \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 1);                              \
@@ -407,7 +420,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
         config.write_zp(static_cast<std::uint8_t>(addr),                   \
-                        OP_CLASS::value(*this));                           \
+                        OP_CLASS::value(view));                           \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -421,14 +434,14 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_ABS_READ(OPCODE, OP_CLASS)                                   \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         base = config.read(addr);                                          \
-        addr = this->pc;                                                   \
+        addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);           \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         addr = static_cast<std::uint16_t>(                                 \
             (base & 0x00FFu) |                                             \
             (static_cast<std::uint16_t>(config.read(addr)) << 8));         \
@@ -436,7 +449,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        OP_CLASS::apply(*this, config.read(addr));                         \
+        OP_CLASS::apply(view, config.read(addr));                         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -449,14 +462,14 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_ABS_JUMP(OPCODE)                                             \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         base = config.read(addr);                                          \
-        addr = this->pc;                                                   \
+        addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);           \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        this->pc = static_cast<std::uint16_t>(                             \
+        pc = static_cast<std::uint16_t>(                             \
             (base & 0x00FFu) |                                             \
             (static_cast<std::uint16_t>(config.read(addr)) << 8));         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                      \
@@ -468,14 +481,14 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 // writes OP_CLASS::value(cpu) instead of reading.
 #define TAWNY_ABS_WRITE(OPCODE, OP_CLASS)                                  \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         base = config.read(addr);                                          \
-        addr = this->pc;                                                   \
+        addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);           \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         addr = static_cast<std::uint16_t>(                                 \
             (base & 0x00FFu) |                                             \
             (static_cast<std::uint16_t>(config.read(addr)) << 8));         \
@@ -483,7 +496,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        config.write(addr, OP_CLASS::value(*this));                        \
+        config.write(addr, OP_CLASS::value(view));                        \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -493,7 +506,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 // (X or Y). The indexed-zp address wraps within ZP ((base + idx) & 0xFF).
 #define TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, IDX)                       \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         addr = config.read(addr);                                          \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 1);                              \
@@ -508,7 +521,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        OP_CLASS::apply(*this,                                             \
+        OP_CLASS::apply(view,                                             \
             config.read_zp(static_cast<std::uint8_t>(addr)));              \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                      \
     }                                                                      \
@@ -517,7 +530,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_ZP_INDEXED_WRITE(OPCODE, OP_CLASS, IDX)                      \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         addr = config.read(addr);                                          \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 1);                              \
@@ -533,16 +546,16 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
         config.write_zp(static_cast<std::uint8_t>(addr),                   \
-                        OP_CLASS::value(*this));                           \
+                        OP_CLASS::value(view));                           \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
 
-#define TAWNY_ZPX_READ(OPCODE, OP_CLASS)  TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, this->x)
-#define TAWNY_ZPY_READ(OPCODE, OP_CLASS)  TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, this->y)
-#define TAWNY_ZPX_WRITE(OPCODE, OP_CLASS) TAWNY_ZP_INDEXED_WRITE(OPCODE, OP_CLASS, this->x)
-#define TAWNY_ZPY_WRITE(OPCODE, OP_CLASS) TAWNY_ZP_INDEXED_WRITE(OPCODE, OP_CLASS, this->y)
+#define TAWNY_ZPX_READ(OPCODE, OP_CLASS)  TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, x)
+#define TAWNY_ZPY_READ(OPCODE, OP_CLASS)  TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, y)
+#define TAWNY_ZPX_WRITE(OPCODE, OP_CLASS) TAWNY_ZP_INDEXED_WRITE(OPCODE, OP_CLASS, x)
+#define TAWNY_ZPY_WRITE(OPCODE, OP_CLASS) TAWNY_ZP_INDEXED_WRITE(OPCODE, OP_CLASS, y)
 
 // ABS_INDEXED_READ — 4 or 5 cycles. Optimistic path: if base_lo + IDX didn't
 // carry, the "wrong" address with the un-carried high byte is actually
@@ -551,14 +564,14 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 // real read.
 #define TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, IDX)                       \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         base = config.read(addr);                                          \
-        addr = this->pc;                                                   \
+        addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);           \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         auto _hi     = config.read(addr);                                  \
         auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));    \
         addr = static_cast<std::uint16_t>(                                 \
@@ -579,7 +592,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
-        OP_CLASS::apply(*this, config.read(addr));                         \
+        OP_CLASS::apply(view, config.read(addr));                         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -588,14 +601,14 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 // ABS_INDEXED_WRITE — always 5 cycles (no skip — penalty always paid).
 #define TAWNY_AB_INDEXED_WRITE(OPCODE, OP_CLASS, IDX)                      \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         base = config.read(addr);                                          \
-        addr = this->pc;                                                   \
+        addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);           \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         auto _hi     = config.read(addr);                                  \
         auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));    \
         addr = static_cast<std::uint16_t>(                                 \
@@ -614,25 +627,25 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
-        config.write(addr, OP_CLASS::value(*this));                        \
+        config.write(addr, OP_CLASS::value(view));                        \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 4)
 
-#define TAWNY_ABX_READ(OPCODE, OP_CLASS)  TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, this->x)
-#define TAWNY_ABY_READ(OPCODE, OP_CLASS)  TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, this->y)
-#define TAWNY_ABX_WRITE(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_WRITE(OPCODE, OP_CLASS, this->x)
-#define TAWNY_ABY_WRITE(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_WRITE(OPCODE, OP_CLASS, this->y)
+#define TAWNY_ABX_READ(OPCODE, OP_CLASS)  TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, x)
+#define TAWNY_ABY_READ(OPCODE, OP_CLASS)  TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, y)
+#define TAWNY_ABX_WRITE(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_WRITE(OPCODE, OP_CLASS, x)
+#define TAWNY_ABY_WRITE(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_WRITE(OPCODE, OP_CLASS, y)
 
 // IZX (indirect,X) read/write — 6 cycles. ZP index with X, then fetch 2-byte
 // pointer from ZP (wrapping in ZP), then read/write from target.
 #define TAWNY_IZX_READ(OPCODE, OP_CLASS)                                   \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         auto _zp = config.read(addr);                                      \
         base = static_cast<std::uint16_t>(                                 \
-            static_cast<std::uint8_t>(_zp + this->x));                     \
+            static_cast<std::uint8_t>(_zp + x));                     \
         addr = static_cast<std::uint16_t>(_zp);                            \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 1);                              \
@@ -662,7 +675,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
-        OP_CLASS::apply(*this, config.read(addr));                         \
+        OP_CLASS::apply(view, config.read(addr));                         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -670,10 +683,10 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_IZX_WRITE(OPCODE, OP_CLASS)                                  \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         auto _zp = config.read(addr);                                      \
         base = static_cast<std::uint16_t>(                                 \
-            static_cast<std::uint8_t>(_zp + this->x));                     \
+            static_cast<std::uint8_t>(_zp + x));                     \
         addr = static_cast<std::uint16_t>(_zp);                            \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 1);                              \
@@ -703,7 +716,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
-        config.write(addr, OP_CLASS::value(*this));                        \
+        config.write(addr, OP_CLASS::value(view));                        \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -713,7 +726,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 // penalty); always 6 for writes.
 #define TAWNY_IZY_READ(OPCODE, OP_CLASS)                                   \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         addr = static_cast<std::uint16_t>(config.read(addr));              \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 1);                              \
@@ -729,7 +742,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
         auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));    \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + this->y);  \
+        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + y);  \
         addr = static_cast<std::uint16_t>(                                 \
             (_hi << 8) | (_lo_sum & 0x00FFu));                             \
         if (_lo_sum > 0xFFu) {                                             \
@@ -748,7 +761,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
-        OP_CLASS::apply(*this, config.read(addr));                         \
+        OP_CLASS::apply(view, config.read(addr));                         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -756,7 +769,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_IZY_WRITE(OPCODE, OP_CLASS)                                  \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         addr = static_cast<std::uint16_t>(config.read(addr));              \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 1);                              \
@@ -772,7 +785,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
         auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));    \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + this->y);  \
+        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + y);  \
         addr = static_cast<std::uint16_t>(                                 \
             (_hi << 8) | (_lo_sum & 0x00FFu));                             \
         base = static_cast<std::uint16_t>(                                 \
@@ -788,7 +801,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
-        config.write(addr, OP_CLASS::value(*this));                        \
+        config.write(addr, OP_CLASS::value(view));                        \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -799,7 +812,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 #define TAWNY_ACC_RMW(OPCODE, OP_CLASS)                                    \
     case ((OPCODE) << 3) | 0: {                                            \
         (void)config.read(addr);                                           \
-        this->a = OP_CLASS::apply(*this, this->a);                         \
+        a = OP_CLASS::apply(view, a);                         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -811,7 +824,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 // ZP_RMW: 5 cycles. ZPX_RMW: 6. ABS_RMW: 6. ABX_RMW: 7 (always).
 #define TAWNY_ZP_RMW(OPCODE, OP_CLASS)                                     \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         addr = config.read(addr);                                          \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 1);                              \
@@ -826,7 +839,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     case ((OPCODE) << 3) | 2: {                                            \
         config.write_zp(static_cast<std::uint8_t>(addr),                   \
                         static_cast<std::uint8_t>(base));                  \
-        base = OP_CLASS::apply(*this, static_cast<std::uint8_t>(base));    \
+        base = OP_CLASS::apply(view, static_cast<std::uint8_t>(base));    \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 3);                              \
     }                                                                      \
@@ -841,7 +854,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_ZPX_RMW(OPCODE, OP_CLASS)                                    \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         addr = config.read(addr);                                          \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 1);                              \
@@ -850,7 +863,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     case ((OPCODE) << 3) | 1: {                                            \
         (void)config.read_zp(static_cast<std::uint8_t>(addr));             \
         addr = static_cast<std::uint16_t>(                                 \
-            static_cast<std::uint8_t>(addr + this->x));                    \
+            static_cast<std::uint8_t>(addr + x));                    \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 2);                              \
     }                                                                      \
@@ -864,7 +877,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     case ((OPCODE) << 3) | 3: {                                            \
         config.write_zp(static_cast<std::uint8_t>(addr),                   \
                         static_cast<std::uint8_t>(base));                  \
-        base = OP_CLASS::apply(*this, static_cast<std::uint8_t>(base));    \
+        base = OP_CLASS::apply(view, static_cast<std::uint8_t>(base));    \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 4);                              \
     }                                                                      \
@@ -879,14 +892,14 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_ABS_RMW(OPCODE, OP_CLASS)                                    \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         base = config.read(addr);                                          \
-        addr = this->pc;                                                   \
+        addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);           \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         addr = static_cast<std::uint16_t>(                                 \
             (base & 0x00FFu) |                                             \
             (static_cast<std::uint16_t>(config.read(addr)) << 8));         \
@@ -900,7 +913,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
         config.write(addr, static_cast<std::uint8_t>(base));               \
-        base = OP_CLASS::apply(*this, static_cast<std::uint8_t>(base));    \
+        base = OP_CLASS::apply(view, static_cast<std::uint8_t>(base));    \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);           \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -913,16 +926,16 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_ABX_RMW(OPCODE, OP_CLASS)                                    \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         base = config.read(addr);                                          \
-        addr = this->pc;                                                   \
+        addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);           \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         auto _hi     = config.read(addr);                                  \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + this->x);  \
+        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + x);  \
         addr = static_cast<std::uint16_t>(                                 \
             (_hi << 8) | (_lo_sum & 0x00FFu));                             \
         base = static_cast<std::uint16_t>(                                 \
@@ -944,7 +957,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
         config.write(addr, static_cast<std::uint8_t>(base));               \
-        base = OP_CLASS::apply(*this, static_cast<std::uint8_t>(base));    \
+        base = OP_CLASS::apply(view, static_cast<std::uint8_t>(base));    \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);           \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -960,14 +973,14 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 // (same page) rather than $(xx+1)00. We replicate.
 #define TAWNY_JMP_IND(OPCODE)                                              \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         base = config.read(addr);                                          \
-        addr = this->pc;                                                   \
+        addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);           \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         addr = static_cast<std::uint16_t>(                                 \
             (base & 0x00FFu) |                                             \
             (static_cast<std::uint16_t>(config.read(addr)) << 8));         \
@@ -984,7 +997,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
-        this->pc = static_cast<std::uint16_t>(                             \
+        pc = static_cast<std::uint16_t>(                             \
             (base & 0x00FFu) |                                             \
             (static_cast<std::uint16_t>(config.read(addr)) << 8));         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                      \
@@ -996,31 +1009,31 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 // PCL, reads addr hi (now forming the jump target), then fetch_opcode.
 #define TAWNY_JSR(OPCODE)                                                  \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         base = config.read(addr);                                          \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        (void)config.read_stack(this->s);                                  \
+        (void)config.read_stack(s);                                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        config.write_stack(this->s, static_cast<std::uint8_t>(this->pc >> 8)); \
-        this->s = static_cast<std::uint8_t>(this->s - 1);                  \
+        config.write_stack(s, static_cast<std::uint8_t>(pc >> 8)); \
+        s = static_cast<std::uint8_t>(s - 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
-        config.write_stack(this->s, static_cast<std::uint8_t>(this->pc));  \
-        this->s = static_cast<std::uint8_t>(this->s - 1);                  \
-        addr = this->pc;                                                   \
+        config.write_stack(s, static_cast<std::uint8_t>(pc));  \
+        s = static_cast<std::uint8_t>(s - 1);                  \
+        addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);           \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
-        this->pc = static_cast<std::uint16_t>(                             \
+        pc = static_cast<std::uint16_t>(                             \
             (base & 0x00FFu) |                                             \
             (static_cast<std::uint16_t>(config.read(addr)) << 8));         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
@@ -1037,28 +1050,28 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        (void)config.read_stack(this->s);                                  \
-        this->s = static_cast<std::uint8_t>(this->s + 1);                  \
+        (void)config.read_stack(s);                                  \
+        s = static_cast<std::uint8_t>(s + 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        base = config.read_stack(this->s);                                 \
-        this->s = static_cast<std::uint8_t>(this->s + 1);                  \
+        base = config.read_stack(s);                                 \
+        s = static_cast<std::uint8_t>(s + 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
-        this->pc = static_cast<std::uint16_t>(                             \
+        pc = static_cast<std::uint16_t>(                             \
             (base & 0x00FFu) |                                             \
-            (static_cast<std::uint16_t>(config.read_stack(this->s)) << 8));\
-        addr = this->pc;                                                   \
+            (static_cast<std::uint16_t>(config.read_stack(s)) << 8));\
+        addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);           \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
         (void)config.read(addr);                                           \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -1073,28 +1086,28 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        (void)config.read_stack(this->s);                                  \
-        this->s = static_cast<std::uint8_t>(this->s + 1);                  \
+        (void)config.read_stack(s);                                  \
+        s = static_cast<std::uint8_t>(s + 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        this->p = static_cast<std::uint8_t>(                               \
-            (config.read_stack(this->s) & ~flag::B) | flag::U);            \
-        this->s = static_cast<std::uint8_t>(this->s + 1);                  \
+        p = static_cast<std::uint8_t>(                               \
+            (config.read_stack(s) & ~flag::B) | flag::U);            \
+        s = static_cast<std::uint8_t>(s + 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
-        base = config.read_stack(this->s);                                 \
-        this->s = static_cast<std::uint8_t>(this->s + 1);                  \
+        base = config.read_stack(s);                                 \
+        s = static_cast<std::uint8_t>(s + 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 4);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
-        this->pc = static_cast<std::uint16_t>(                             \
+        pc = static_cast<std::uint16_t>(                             \
             (base & 0x00FFu) |                                             \
-            (static_cast<std::uint16_t>(config.read_stack(this->s)) << 8));\
+            (static_cast<std::uint16_t>(config.read_stack(s)) << 8));\
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -1109,8 +1122,8 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        config.write_stack(this->s, OP_CLASS::value(*this));               \
-        this->s = static_cast<std::uint8_t>(this->s - 1);                  \
+        config.write_stack(s, OP_CLASS::value(view));               \
+        s = static_cast<std::uint8_t>(s - 1);                  \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -1125,13 +1138,13 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        (void)config.read_stack(this->s);                                  \
-        this->s = static_cast<std::uint8_t>(this->s + 1);                  \
+        (void)config.read_stack(s);                                  \
+        s = static_cast<std::uint8_t>(s + 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        OP_CLASS::apply(*this, config.read_stack(this->s));                \
+        OP_CLASS::apply(view, config.read_stack(s));                \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -1143,8 +1156,8 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     case ((OPCODE) << 3) | 0: {                                            \
         /* Leave addr pointing at the JAM opcode — next opcode fetch will  \
            hit the same address, triggering the trap or at least spinning. */ \
-        this->pc = static_cast<std::uint16_t>(this->pc - 1);               \
-        addr = this->pc;                                                   \
+        pc = static_cast<std::uint16_t>(pc - 1);               \
+        addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost_opcode(addr), ((OPCODE) << 3) | 0);    \
         break;                                                             \
     }
@@ -1168,42 +1181,42 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     case ((OPCODE) << 3) | 0: {                                               \
         (void)config.read(addr);                                              \
         if (brk_flags == BrkFlags::None) {                                    \
-            this->pc = static_cast<std::uint16_t>(this->pc + 1);              \
+            pc = static_cast<std::uint16_t>(pc + 1);              \
         }                                                                     \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                                \
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 1: {                                               \
         if (brk_flags == BrkFlags::Reset) {                                   \
-            (void)config.read_stack(this->s);                                 \
+            (void)config.read_stack(s);                                 \
         } else {                                                              \
-            config.write_stack(this->s, static_cast<std::uint8_t>(this->pc >> 8)); \
+            config.write_stack(s, static_cast<std::uint8_t>(pc >> 8)); \
         }                                                                     \
-        this->s = static_cast<std::uint8_t>(this->s - 1);                     \
+        s = static_cast<std::uint8_t>(s - 1);                     \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                                \
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 2: {                                               \
         if (brk_flags == BrkFlags::Reset) {                                   \
-            (void)config.read_stack(this->s);                                 \
+            (void)config.read_stack(s);                                 \
         } else {                                                              \
-            config.write_stack(this->s, static_cast<std::uint8_t>(this->pc)); \
+            config.write_stack(s, static_cast<std::uint8_t>(pc)); \
         }                                                                     \
-        this->s = static_cast<std::uint8_t>(this->s - 1);                     \
+        s = static_cast<std::uint8_t>(s - 1);                     \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                                \
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
         if (brk_flags == BrkFlags::Reset) {                                   \
-            (void)config.read_stack(this->s);                                 \
+            (void)config.read_stack(s);                                 \
         } else {                                                              \
             std::uint8_t _pushed_p = (brk_flags == BrkFlags::None)            \
-                ? static_cast<std::uint8_t>(this->p | flag::B | flag::U)      \
-                : static_cast<std::uint8_t>(this->p | flag::U);               \
-            config.write_stack(this->s, _pushed_p);                           \
+                ? static_cast<std::uint8_t>(p | flag::B | flag::U)      \
+                : static_cast<std::uint8_t>(p | flag::U);               \
+            config.write_stack(s, _pushed_p);                           \
         }                                                                     \
-        this->s = static_cast<std::uint8_t>(this->s - 1);                     \
-        this->p = static_cast<std::uint8_t>(this->p | flag::I);               \
+        s = static_cast<std::uint8_t>(s - 1);                     \
+        p = static_cast<std::uint8_t>(p | flag::I);               \
         addr = (brk_flags == BrkFlags::Nmi)   ? 0xFFFAu                       \
              : (brk_flags == BrkFlags::Reset) ? 0xFFFCu                       \
              :                                  0xFFFEu;                      \
@@ -1217,10 +1230,10 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 5: {                                               \
-        this->pc = static_cast<std::uint16_t>(                                \
+        pc = static_cast<std::uint16_t>(                                \
             (base & 0x00FFu) |                                                \
             (static_cast<std::uint16_t>(config.read_vector(addr)) << 8));     \
-        this->brk_flags = BrkFlags::None;                                     \
+        brk_flags = BrkFlags::None;                                     \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 6);                         \
     }                                                                         \
     [[fallthrough]];                                                          \
@@ -1238,27 +1251,27 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 #define TAWNY_REL_BRANCH(OPCODE, COND)                                     \
     case ((OPCODE) << 3) | 0: {                                            \
-        this->pc = static_cast<std::uint16_t>(this->pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);               \
         auto _off = static_cast<std::int8_t>(config.read(addr));           \
-        if (!COND::taken(*this)) {                                         \
+        if (!COND::taken(view)) {                                         \
             tst = ((OPCODE) << 3) | 3;                                     \
             TAWNY_NEXT_OPCODE_FETCH(tst);                                  \
             break;                                                         \
         }                                                                  \
         auto _tgt = static_cast<std::uint16_t>(                            \
-            this->pc + static_cast<std::int16_t>(_off));                   \
+            pc + static_cast<std::int16_t>(_off));                   \
         auto _wrong = static_cast<std::uint16_t>(                          \
-            (this->pc & 0xFF00u) | (_tgt & 0x00FFu));                      \
+            (pc & 0xFF00u) | (_tgt & 0x00FFu));                      \
         if (_wrong == _tgt) {                                              \
-            this->pc = _tgt;                                               \
-            addr = this->pc;                                               \
+            pc = _tgt;                                               \
+            addr = pc;                                               \
             tst  = ((OPCODE) << 3) | 1;                                    \
             TAWNY_STEP_TAIL(access_cost(addr), tst);                       \
             break;                                                         \
         }                                                                  \
-        this->pc = _wrong;                                                 \
+        pc = _wrong;                                                 \
         base     = _tgt;                                                   \
-        addr     = this->pc;                                               \
+        addr     = pc;                                               \
         tst      = ((OPCODE) << 3) | 2;                                    \
         TAWNY_STEP_TAIL(access_cost(addr), tst);                           \
         break;                                                             \
@@ -1271,7 +1284,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     case ((OPCODE) << 3) | 2: {                                            \
         (void)config.read(addr);                                           \
-        this->pc = base;                                                   \
+        pc = base;                                                   \
         tst = ((OPCODE) << 3) | 3;                                         \
         TAWNY_NEXT_OPCODE_FETCH(tst);                                      \
         break;                                                             \
@@ -1289,27 +1302,34 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 
 template <M6502Config Config>
 struct M6502 {
-    // Registers.
-    std::uint16_t pc{};
-    std::uint8_t  a{};
-    std::uint8_t  x{};
-    std::uint8_t  y{};
-    std::uint8_t  s{0xFD};
-    std::uint8_t  p{flag::I | flag::U};
-
-    // Emulation state.
-    std::uint16_t tstate{};                     // (ir << 3) | step
-    std::uint16_t base_addr{};                  // scratch across multi-step ops
-    BrkFlags      brk_flags{BrkFlags::Reset};
-
-    // Pending bus op — the phi2 the *next* run_until iteration will perform.
-    std::uint16_t pending_addr{};
+    // Layout is deliberate: the 8-byte cycle first (so it's 8-aligned without
+    // internal padding), then pc + the u8 registers with brk_flags packed next
+    // to p (no hole after p), then the u16 emulation-state fields. Fits the
+    // whole working set into the first 24 bytes, and cycle lands at offset 0
+    // so the hot load inside run_until is a `mov (%rdi), ...` (no displacement).
 
     // Start time of the next cycle to run. reset() pre-pays the cost of the
     // first access, so the run loop can enter phi2 on iteration 1 without a
     // bootstrap branch.
-    Cycle cycle{};
+    Cycle         cycle{};                         // offset 0
 
+    // Registers.
+    std::uint16_t pc{};                            // 8
+    std::uint8_t  a{};                             // 10
+    std::uint8_t  x{};                             // 11
+    std::uint8_t  y{};                             // 12
+    std::uint8_t  s{0xFD};                         // 13
+    std::uint8_t  p{flag::I | flag::U};            // 14
+    BrkFlags      brk_flags{BrkFlags::Reset};      // 15  (packs next to p)
+
+    // Emulation state.
+    std::uint16_t tstate{};                        // 16  (ir << 3) | step
+    std::uint16_t base_addr{};                     // 18  scratch across multi-step ops
+
+    // Pending bus op — the phi2 the *next* run_until iteration will perform.
+    std::uint16_t pending_addr{};                  // 20
+
+    // 22..23: padding to 8-byte align config's first field (unique_ptr).
     Config config;
 
     explicit M6502(Config cfg) noexcept(std::is_nothrow_move_constructible_v<Config>)
@@ -1354,10 +1374,23 @@ struct M6502 {
     {
         sample_interrupts();
 
+        // Hot state is cached in stack locals for the duration of the loop
+        // and written back at `exit:`. Empirically worth ~30-35% over
+        // struct-field references — the compiler can't hoist the fields
+        // into registers across `config.*` calls, because `config` is a
+        // member of `*this` and alias analysis conservatively assumes a
+        // call through one member could touch others.
         auto current = cycle;
         auto addr    = pending_addr;
         auto tst     = tstate;
         auto base    = base_addr;
+        auto pc      = this->pc;   // shadow member so macros can write bare `pc`
+        auto a       = this->a;
+        auto x       = this->x;
+        auto y       = this->y;
+        auto s       = this->s;
+        auto p       = this->p;
+        detail::RegView view{a, x, y, s, p};  // refs to the locals; passed to op classes
 
         while (current < horizon) {
             switch (tst) {
@@ -1670,6 +1703,12 @@ struct M6502 {
         pending_addr = addr;
         tstate       = tst;
         base_addr    = base;
+        this->pc     = pc;       // disambiguate: left-hand is the struct member
+        this->a      = a;
+        this->x      = x;
+        this->y      = y;
+        this->s      = s;
+        this->p      = p;
         return current;
     }
 };
