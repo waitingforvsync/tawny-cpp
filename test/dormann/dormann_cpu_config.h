@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "emulator/m6502.h"
+
 namespace tawny::dormann {
 
 // M6502Config for running the Klaus Dormann functional test.
@@ -10,25 +12,24 @@ namespace tawny::dormann {
 // Owns a zero-initialised 64K RAM buffer. All accesses are trivial,
 // single-cycle direct RAM hits (no MMIO).
 //
-// The one non-trivial behaviour is in read_opcode: we watch for two
-// consecutive opcode fetches at the same PC, which is the signature of every
-// trap the test uses ("JMP *", "BNE *", etc.). When that happens we raise
-// stop_flag, which ends the timeslice after the trap instruction completes.
-// The test code then inspects the CPU's PC to tell success (= success_addr)
+// Trap detection lives in `access_cost_opcode`: when the CPU is about to
+// fetch an opcode at the same address it fetched last, we set stop=true —
+// that pattern catches every trap the test uses (JMP *, BNE *, BXX *, …).
+// The test code inspects cpu.pc on return to tell success (pc == success_addr)
 // from a failure trap (any other address).
+//
+// Note the split: `read_opcode` does the state update (last_opcode_addr);
+// `access_cost_opcode` just compares. That keeps access_cost_* pure /
+// idempotent, as the concept's contract requires.
 struct DormannCpuConfig {
     std::unique_ptr<std::uint8_t[]> mem{std::make_unique<std::uint8_t[]>(65536)};
 
-    // Sentinel outside the 16-bit range so the very first opcode fetch can
-    // never match. std::uint32_t gives us room for that sentinel.
+    // Sentinel outside the 16-bit range so the very first opcode fetch can't
+    // match. std::uint32_t gives us room.
     std::uint32_t last_opcode_addr{0x10000};
-    bool stop_flag{false};
 
     auto read_opcode(std::uint16_t addr) -> std::uint8_t
     {
-        if (addr == last_opcode_addr) {
-            stop_flag = true;
-        }
         last_opcode_addr = addr;
         return mem[addr];
     }
@@ -42,13 +43,14 @@ struct DormannCpuConfig {
     auto write_stack(std::uint8_t sp, std::uint8_t val) -> void   { mem[0x0100 | sp] = val; }
     auto write(std::uint16_t addr, std::uint8_t val) -> void      { mem[addr] = val; }
 
-    auto access_cost_opcode(std::uint16_t) const -> unsigned  { return 1; }
-    auto access_cost_zp(std::uint8_t) const -> unsigned       { return 1; }
-    auto access_cost_stack(std::uint8_t) const -> unsigned    { return 1; }
-    auto access_cost_vector(std::uint16_t) const -> unsigned  { return 1; }
-    auto access_cost(std::uint16_t) const -> unsigned         { return 1; }
-
-    auto stop_requested() const -> bool { return stop_flag; }
+    auto access_cost_opcode(std::uint16_t addr) const -> AccessCost
+    {
+        return {1, addr == last_opcode_addr};
+    }
+    auto access_cost_zp(std::uint8_t) const -> AccessCost       { return {1, false}; }
+    auto access_cost_stack(std::uint8_t) const -> AccessCost    { return {1, false}; }
+    auto access_cost_vector(std::uint16_t) const -> AccessCost  { return {1, false}; }
+    auto access_cost(std::uint16_t) const -> AccessCost         { return {1, false}; }
 };
 
 }  // namespace tawny::dormann

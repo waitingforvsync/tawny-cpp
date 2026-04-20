@@ -6,24 +6,24 @@
 // Compile-time check that DormannCpuConfig satisfies the M6502Config concept.
 static_assert(tawny::M6502Config<tawny::dormann::DormannCpuConfig>);
 
-TEST_CASE("DormannCpuConfig detects JMP * trap") {
+TEST_CASE("DormannCpuConfig: access_cost_opcode is pure; read_opcode updates state") {
     tawny::dormann::DormannCpuConfig cfg{};
+    cfg.mem[0x0400] = 0x4C;  // contents don't matter, but make them realistic
 
-    // Place JMP $0400 at $0400. Fetching opcode at $0400 twice should raise stop.
-    cfg.mem[0x0400] = 0x4C;
-    cfg.mem[0x0401] = 0x00;
-    cfg.mem[0x0402] = 0x04;
+    // First check at $0400: last_opcode_addr is the sentinel — no stop.
+    CHECK(cfg.access_cost_opcode(0x0400).cost == 1);
+    CHECK_FALSE(cfg.access_cost_opcode(0x0400).stop);
 
-    CHECK_FALSE(cfg.stop_requested());
-    cfg.read_opcode(0x0400);
-    CHECK_FALSE(cfg.stop_requested());  // first fetch — last_opcode_addr was sentinel
-    cfg.read_opcode(0x0400);
-    CHECK(cfg.stop_requested());        // second identical fetch — trap detected
-}
+    // Multiple access_cost_opcode calls are idempotent — state is not mutated.
+    CHECK_FALSE(cfg.access_cost_opcode(0x0400).stop);
 
-TEST_CASE("M6502 constructs from moved-in DormannCpuConfig") {
-    tawny::M6502 cpu{tawny::dormann::DormannCpuConfig{}};
+    // Only read_opcode updates last_opcode_addr.
+    (void)cfg.read_opcode(0x0400);
 
-    cpu.config.mem[0x1234] = 0x42;
-    CHECK(cpu.config.read(0x1234) == 0x42);
+    // Now a subsequent access_cost_opcode at the same address sees the match.
+    CHECK(cfg.access_cost_opcode(0x0400).stop);
+    CHECK(cfg.access_cost_opcode(0x0400).cost == 1);
+
+    // A different address: no stop.
+    CHECK_FALSE(cfg.access_cost_opcode(0x0401).stop);
 }
