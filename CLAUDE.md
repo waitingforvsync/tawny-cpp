@@ -56,19 +56,23 @@ int compute(int x)
 
 ## Project structure
 - `src/main.cpp` — Application entry point, GLFW window, OpenGL context, doctest integration
+- `src/emulator/` — Emulation core
+  - `m6502.h` — MOS 6502 CPU: `M6502Config` concept, `M6502<Config>` template, full NMOS opcode set with fall-through dispatch macros, BRK-based reset (seeds `tstate = 0`, `brk_flags = Reset`)
 - `test/` — Heavyweight test files (compiled into the same executable)
-- `extern/` — Vendored dependencies (doctest.h, glad/)
+  - `test/dormann/` — Klaus Dormann functional test image + config + harness
+  - `test/emulator/` — CPU unit tests + functional-test profiling runner
+- `extern/` — Vendored dependencies (doctest, glad/)
 
 ## Testing
 - Single executable: `./tawny --test` runs tests, otherwise runs the emulator
 - In-source tests: write `TEST_CASE` in any .cpp file in src/
 - Standalone tests: add .cpp files to test/
 - Tests run automatically as a post-build step
-- Release builds strip all test code via `DOCTEST_CONFIG_DISABLE`
+- Tests compile in **every** build type (no DOCTEST_CONFIG_DISABLE gate) — Release is preferred for profiling/benchmark tests like the Dormann functional-test runner
 
 ## Build & run
 ```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/tawny
 ```
