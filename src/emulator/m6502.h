@@ -558,35 +558,43 @@ struct Usbc { static void apply(Registers &r, std::uint8_t v) { Sbc::apply(r, v)
 // real read.
 #define TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, IDX)                       \
     case ((OPCODE) << 3) | 0: {                                            \
-        pc = static_cast<std::uint16_t>(pc + 1);               \
+        pc = static_cast<std::uint16_t>(pc + 1);                           \
         base = config.read(addr);                                          \
-        addr = pc;                                                   \
+        addr = pc;                                                         \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);           \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        pc = static_cast<std::uint16_t>(pc + 1);               \
-        auto _hi     = config.read(addr);                                  \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));    \
-        addr = static_cast<std::uint16_t>(                                 \
-            (_hi << 8) | (_lo_sum & 0x00FFu));                             \
-        if (_lo_sum > 0xFFu) {                                             \
-            base = static_cast<std::uint16_t>(addr + 0x0100u);             \
-            tst  = ((OPCODE) << 3) | 2;                                    \
-        } else {                                                           \
-            tst  = ((OPCODE) << 3) | 3;                                    \
+        pc = static_cast<std::uint16_t>(pc + 1);                           \
+        /* Compute target addr + page-cross flag in a tight sub-scope so   \
+           _hi/_lo_sum aren't live at the step-2 case label below (case    \
+           labels can't bypass initializations in enclosing scope). */     \
+        bool _cross;                                                       \
+        {                                                                  \
+            auto _hi     = config.read(addr);                              \
+            auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));\
+            addr = static_cast<std::uint16_t>(                             \
+                (_hi << 8) | (_lo_sum & 0x00FFu));                         \
+            _cross = _lo_sum > 0xFFu;                                      \
         }                                                                  \
-        TAWNY_STEP_TAIL(access_cost(addr), tst);                           \
-        break;                                                             \
-    }                                                                      \
-    case ((OPCODE) << 3) | 2: {                                            \
-        (void)config.read(addr);                                           \
-        addr = base;                                                       \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);           \
+        /* Common path: no page cross — fall straight through to step 3,   \
+           no break, no tst write, no re-dispatch. On page cross we enter  \
+           the if body and the nested step-2 case label, then also fall   \
+           through to step 3. */                                           \
+        if (_cross) {                                                      \
+            base = static_cast<std::uint16_t>(addr + 0x0100u);             \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);       \
+    case ((OPCODE) << 3) | 2:                                              \
+            (void)config.read(addr);                                       \
+            addr = base;                                                   \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);       \
+        } else {                                                           \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);       \
+        }                                                                  \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
-        OP_CLASS::apply(r, config.read(addr));                         \
+        OP_CLASS::apply(r, config.read(addr));                             \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -735,27 +743,32 @@ struct Usbc { static void apply(Registers &r, std::uint8_t v) { Sbc::apply(r, v)
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));    \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);  \
-        addr = static_cast<std::uint16_t>(                                 \
-            (_hi << 8) | (_lo_sum & 0x00FFu));                             \
-        if (_lo_sum > 0xFFu) {                                             \
-            base = static_cast<std::uint16_t>(addr + 0x0100u);             \
-            tst  = ((OPCODE) << 3) | 3;                                    \
-        } else {                                                           \
-            tst  = ((OPCODE) << 3) | 4;                                    \
+        /* Same trick as AB_INDEXED_READ: nested step-3 case label inside  \
+           the page-cross branch, fall straight through to step 4 on the   \
+           common (no-cross) path. _hi/_lo_sum scoped tightly so the case  \
+           label doesn't bypass their initializations. */                  \
+        bool _cross;                                                       \
+        {                                                                  \
+            auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));\
+            auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);  \
+            addr = static_cast<std::uint16_t>(                             \
+                (_hi << 8) | (_lo_sum & 0x00FFu));                         \
+            _cross = _lo_sum > 0xFFu;                                      \
         }                                                                  \
-        TAWNY_STEP_TAIL(access_cost(addr), tst);                           \
-        break;                                                             \
-    }                                                                      \
-    case ((OPCODE) << 3) | 3: {                                            \
-        (void)config.read(addr);                                           \
-        addr = base;                                                       \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);           \
+        if (_cross) {                                                      \
+            base = static_cast<std::uint16_t>(addr + 0x0100u);             \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);       \
+    case ((OPCODE) << 3) | 3:                                              \
+            (void)config.read(addr);                                       \
+            addr = base;                                                   \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);       \
+        } else {                                                           \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);       \
+        }                                                                  \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
-        OP_CLASS::apply(r, config.read(addr));                         \
+        OP_CLASS::apply(r, config.read(addr));                             \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -1233,56 +1246,54 @@ struct Usbc { static void apply(Registers &r, std::uint8_t v) { Sbc::apply(r, v)
     [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 6)
 
-// REL_BRANCH(OPCODE, COND) — 2/3/4 cycles. Variable paths forbid fall-through
-// between steps; each step ends with `break` and sets tst explicitly.
-//   step 0: read offset; if !taken, jump to step 3 (opcode fetch); if taken
-//           without page cross, jump to step 1; if taken with page cross, stash
-//           target in `base` and jump to step 2.
-//   step 1: taken no cross — dummy read at target, then opcode fetch.
-//   step 2: taken cross — dummy read at wrong page, set pc = base (correct
-//           target), then opcode fetch.
-//   step 3: opcode fetch for next instruction.
+// REL_BRANCH(OPCODE, COND) — 2/3/4 cycles. Three outcomes:
+//   not-taken — fall straight through to step 3 (opcode fetch).
+//   taken, no page cross — one dummy read at target (step 1), then step 3.
+//   taken, page cross — dummy read at wrong page, fix pc (step 2), step 3.
+// Step-1 and step-2 case labels live inside the relevant branches of the if
+// chain in step 0, so the common paths fall through with no tst write and
+// no re-dispatch via the switch.
 
 #define TAWNY_REL_BRANCH(OPCODE, COND)                                     \
     case ((OPCODE) << 3) | 0: {                                            \
-        pc = static_cast<std::uint16_t>(pc + 1);               \
-        auto _off = static_cast<std::int8_t>(config.read(addr));           \
-        if (!COND::taken(r)) {                                         \
-            tst = ((OPCODE) << 3) | 3;                                     \
-            TAWNY_NEXT_OPCODE_FETCH(tst);                                  \
-            break;                                                         \
+        pc = static_cast<std::uint16_t>(pc + 1);                           \
+        /* _taken / _cross declared without initializers (scalars — legal  \
+           to jump past), so the step-1 / step-2 case labels below can be  \
+           reached via the switch without hitting a bypassed init. Both   \
+           are always assigned before they're read on any path. */         \
+        bool _taken;                                                       \
+        bool _cross;                                                       \
+        {                                                                  \
+            auto _off = static_cast<std::int8_t>(config.read(addr));       \
+            _taken = COND::taken(r);                                       \
+            if (_taken) {                                                  \
+                auto _tgt   = static_cast<std::uint16_t>(                  \
+                    pc + static_cast<std::int16_t>(_off));                 \
+                auto _wrong = static_cast<std::uint16_t>(                  \
+                    (pc & 0xFF00u) | (_tgt & 0x00FFu));                    \
+                _cross = _wrong != _tgt;                                   \
+                pc = _cross ? _wrong : _tgt;                               \
+                if (_cross) base = _tgt;                                   \
+            }                                                              \
         }                                                                  \
-        auto _tgt = static_cast<std::uint16_t>(                            \
-            pc + static_cast<std::int16_t>(_off));                   \
-        auto _wrong = static_cast<std::uint16_t>(                          \
-            (pc & 0xFF00u) | (_tgt & 0x00FFu));                      \
-        if (_wrong == _tgt) {                                              \
-            pc = _tgt;                                               \
-            addr = pc;                                               \
-            tst  = ((OPCODE) << 3) | 1;                                    \
-            TAWNY_STEP_TAIL(access_cost(addr), tst);                       \
-            break;                                                         \
+        if (!_taken) {                                                     \
+            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                  \
+        } else if (!_cross) {                                              \
+            addr = pc;                                                     \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);       \
+    case ((OPCODE) << 3) | 1:                                              \
+            (void)config.read(addr);                                       \
+            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                  \
+        } else {                                                           \
+            addr = pc;                                                     \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);       \
+    case ((OPCODE) << 3) | 2:                                              \
+            (void)config.read(addr);                                       \
+            pc = base;                                                     \
+            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                  \
         }                                                                  \
-        pc = _wrong;                                                 \
-        base     = _tgt;                                                   \
-        addr     = pc;                                               \
-        tst      = ((OPCODE) << 3) | 2;                                    \
-        TAWNY_STEP_TAIL(access_cost(addr), tst);                           \
-        break;                                                             \
     }                                                                      \
-    case ((OPCODE) << 3) | 1: {                                            \
-        (void)config.read(addr);                                           \
-        tst = ((OPCODE) << 3) | 3;                                         \
-        TAWNY_NEXT_OPCODE_FETCH(tst);                                      \
-        break;                                                             \
-    }                                                                      \
-    case ((OPCODE) << 3) | 2: {                                            \
-        (void)config.read(addr);                                           \
-        pc = base;                                                   \
-        tst = ((OPCODE) << 3) | 3;                                         \
-        TAWNY_NEXT_OPCODE_FETCH(tst);                                      \
-        break;                                                             \
-    }                                                                      \
+    [[fallthrough]];                                                       \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
 
 // -----------------------------------------------------------------------------
