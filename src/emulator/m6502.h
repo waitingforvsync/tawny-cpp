@@ -1357,6 +1357,23 @@ struct M6502 {
         cycle        = config.access_cost(pending_addr).cost;
     }
 
+    // Start execution at `target` without going through the reset sequence.
+    // Registers (A/X/Y/S/P) are left untouched — the caller is responsible
+    // for setting them up if the target code relies on specific values.
+    //
+    // Mechanism: land in the synthetic opcode-fetch tstate `0x7FF` — added
+    // at the end of the switch — so the first dispatch reads the opcode at
+    // `target` and jumps into the normal instruction pipeline. `cycle` is
+    // pre-paid with the cost of that first fetch (matching reset's pattern).
+    auto set_pc(std::uint16_t target) -> void
+    {
+        pc           = target;
+        pending_addr = target;
+        tstate       = 0x7FF;
+        brk_flags    = BrkFlags::None;
+        cycle        = config.access_cost_opcode(target).cost;
+    }
+
     // Stage 1 stub — the single place IRQ/NMI signals would be observed at
     // the boundary of a timeslice. IRQ/NMI pipeline is a follow-up.
     auto sample_interrupts() -> void {}
@@ -1680,6 +1697,12 @@ struct M6502 {
                 TAWNY_ABX_READ  (0xFD, detail::Sbc)       // SBC abs,X
                 TAWNY_ABX_RMW   (0xFE, detail::Inc)          // INC abs,X
                 TAWNY_ABX_RMW   (0xFF, detail::Isc)          // ISC abs,X*
+
+                // Synthetic "bootstrap opcode fetch" tstate used by set_pc().
+                // Safe slot: the longest instruction is 7 cycles (steps 0-6),
+                // so step 7 is never produced by normal dispatch. 0xFF step 7
+                // is (0xFF << 3) | 7 = 0x7FF.
+                TAWNY_FETCH_OPCODE_CASE(0xFF, 7)
 
                 default:
                     // Unreachable — every tstate value is covered. If we get

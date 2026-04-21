@@ -28,16 +28,17 @@ TEST_CASE("Dormann: 6502 functional test passes + profile clock speed") {
     for (int i = 0; i < runs; ++i) {
         // Fresh CPU + fresh RAM per run. `DormannCpuConfig`'s constructor
         // allocates a zero-initialised 64K buffer; we write the test binary
-        // at load_addr and set the reset vector to entry_addr.
+        // at load_addr and set PC directly via set_pc() — no reset vector
+        // needed, since set_pc skips the reset sequence and jumps straight
+        // into the test's first opcode.
         tawny::dormann::DormannCpuConfig cfg{};
         std::memcpy(
             cfg.mem.get() + tawny::dormann::load_addr,
             tawny::dormann::functional_test_bin,
             sizeof(tawny::dormann::functional_test_bin));
-        cfg.mem[0xFFFC] = static_cast<std::uint8_t>(tawny::dormann::entry_addr & 0xFFu);
-        cfg.mem[0xFFFD] = static_cast<std::uint8_t>(tawny::dormann::entry_addr >> 8);
 
         tawny::M6502 cpu{std::move(cfg)};
+        cpu.set_pc(tawny::dormann::entry_addr);
 
         auto start = std::chrono::steady_clock::now();
         // Horizon large enough that the only way we return is via the trap
