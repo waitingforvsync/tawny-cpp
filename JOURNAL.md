@@ -127,3 +127,26 @@
 - **`RegView` generalises the shadow trick for a/x/y/s/p.** Op classes take a `C&` template parameter; whether `C` is `M6502<Config>` or `RegView` doesn't matter to the op classes (they just use `c.a`, `c.p`, etc.). The dispatch switch constructs one `RegView view{a, x, y, s, p};` at the top of `run_until` and passes `view` into op classes. SROA'd away by the optimizer so it compiles to direct local accesses.
 - **Diminishing returns past `pc`.** `pc` is touched on nearly every cycle (increment in operand fetches, update in jumps/branches); the other registers only by specific ops. So pc alone captured most of the win. Caching a/x/y/s/p still yields ~4% — worth the small amount of extra code because the wrapper is tidy and the op classes don't change.
 - **Removed `this->` throughout the dispatch macros.** Initially inherited from the user's sketch; CLAUDE.md already says `this->` isn't mandatory in our style, so stripping it brings the macros in line and makes the shadowing work naturally (`pc` in a macro is the local when the caller has one, the member when it doesn't).
+
+## 2026-04-21 — `RegView` refs → single `Registers&`: +9% to ~890 MHz
+
+### What we did
+- Replaced `detail::RegView` (struct of five `uint8_t&` members) with `detail::Registers` — a plain struct of values (`a, x, y, s, p`).
+- Dropped the `template <typename C>` parameter on every op class. Each op now takes `detail::Registers& r` directly — no duck-typing, no instantiation per call type.
+- `detail::set_nz` and `detail::set_flag` likewise take `Registers&` instead of `uint8_t& p`, for consistency with the ops.
+- In `run_until`, the five scalar `a/x/y/s/p` locals collapse into one `auto r = detail::Registers{this->a, this->x, this->y, this->s, this->p};`. Every macro body that used bare `a`, `x`, `y`, `s`, `p` now uses `r.a`, `r.x`, etc. `pc` stays as its own scalar local — it's the only register that doesn't live in `Registers`.
+- Tests are unchanged — `M6502` still exposes `a`, `x`, `y`, `s`, `p`, `pc` as individual struct fields; `run_until` does the local-aggregation only for the duration of the loop and writes the fields back at `exit:`.
+- Measurements (Release, 10-run median over the Dormann profile): ~890 MHz (range 816–960). Prior baseline (RegView refs): ~815 MHz. **+9% at the median.**
+
+### What we tried and walked away from
+Before landing on `Registers&`, the session explored two other shapes, both discarded:
+
+- **Per-op macros replacing `detail::` entirely.** Every mnemonic became a `TAWNY_OP_<CAT>_<NAME>(R, VAL)` macro dispatched via token-paste. Worked and tested clean, but didn't improve over this `Registers&` design and made the header substantially harder to read. Reverted.
+- **`Registers` by value + `{value, flags}` return.** Ops took a `Registers` by value and returned an updated copy; call sites packed/unpacked at every invocation. Should in theory SROA cleanly but measured ~750 MHz — noticeably worse than either RegView or `Registers&`. The optimizer treats each aggregate construction/destructuring as its own local sequence and doesn't coalesce across adjacent op calls as well as it does with a persistent in-place aggregate. Reverted.
+- **`set_nz`/`set_flag` as macros instead of inline functions.** Measured ~15% slower than the `[[gnu::always_inline]]` function form. Cause: macros evaluate `VAL`/`BIT` twice (in the two halves of the expression), and the compiler makes different register-allocation choices for duplicated subexpressions even though it could CSE them. Reverted.
+
+### Design decisions
+- **Why `Registers&` beats `RegView`.** `RegView` held five independent references to five independent scalar locals. Even with SROA, the compiler has to track each reference separately — from its point of view the ops take five distinct pointer-like arguments. With a single `Registers&` pointing at one aggregate local, SROA decomposes the struct into scalar registers once and inlining folds the reference away; the ops see a coherent unit rather than five loose pointers. Fewer constraints on register allocation for the optimizer to carry around.
+- **Why ops can't be "pure" (in/out by value) without pack/unpack cost.** Ops are functions, not macros — they can't mutate the caller's locals directly. The options are (a) pass-by-ref + void return, or (b) pass-by-value + return an updated aggregate. The by-value form requires the caller to destructure the return back into the locals, and the optimizer handles this chain of `construct → call → destructure` less cleanly than a persistent in-place aggregate. Ref+void won the measurement.
+- **Decimal ADC/SBC stay inline.** At one point they were factored out as `[[gnu::cold]] [[gnu::noinline]]` slow paths (to avoid polluting hot-path codegen if the compiler spilled `r` to memory for the call). In this `Registers&` design the decimal paths are inlined back into `Adc::apply` / `Sbc::apply` and simply branch on `r.p & flag::D`. Branch prediction keeps them out of the hot path on the Dormann test (D never set); no observable cost.
+- **`set_nz`/`set_flag` taking `Registers&` vs `uint8_t&`.** Measured identical perf after inlining — the call sites resolve to the same IR either way. Kept the `Registers&` form for consistency with the op classes: everything in `detail::` that touches the register file now takes the same parameter type.

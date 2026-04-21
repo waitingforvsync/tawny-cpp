@@ -86,109 +86,103 @@ namespace flag {
 
 namespace detail {
 
-[[gnu::always_inline]] inline auto set_nz(std::uint8_t &p, std::uint8_t val) -> void
-{
-    p = static_cast<std::uint8_t>((p & ~(flag::N | flag::Z))
-                                   | (val & flag::N)
-                                   | (val == 0 ? flag::Z : 0));
-}
-
-[[gnu::always_inline]] inline auto set_flag(std::uint8_t &p, std::uint8_t bit, bool on) -> void
-{
-    p = static_cast<std::uint8_t>(on ? (p | bit) : (p & ~bit));
-}
-
-// Lightweight "register view" passed to op classes in place of the whole
-// M6502 reference. Holds references to run_until's register locals so that
-// ops like `Lda::apply(v) { c.a = v; set_nz(c.p, v); }` mutate the locals,
-// not the struct fields. Op classes stay template-generic on C and continue
-// to work whether called with an M6502 reference or this view.
-struct RegView {
-    std::uint8_t &a;
-    std::uint8_t &x;
-    std::uint8_t &y;
-    std::uint8_t &s;
-    std::uint8_t &p;
+// CPU register file. Lives as a local in run_until — constructed from the
+// M6502 struct's fields at entry and written back at exit. Ops take it by
+// mutable reference so they can update multiple fields at once without the
+// pack/unpack dance that by-value returns would need.
+struct Registers {
+    std::uint8_t a;
+    std::uint8_t x;
+    std::uint8_t y;
+    std::uint8_t s;
+    std::uint8_t p;
 };
 
-// Op classes — small structs providing the per-mnemonic transform. Reused
-// across addressing-mode macros. All methods templated on the CPU type so
-// they compose with the templated M6502<Config>.
+[[gnu::always_inline]] inline auto set_nz(Registers &r, std::uint8_t val) -> void
+{
+    r.p = static_cast<std::uint8_t>((r.p & ~(flag::N | flag::Z))
+                                     | (val & flag::N)
+                                     | (val == 0 ? flag::Z : 0));
+}
 
-// ---- Read ops (consume a byte, update register/flags) ----
-struct Lda { template <typename C> static void apply(C &c, std::uint8_t v) { c.a = v; set_nz(c.p, v); } };
-struct Ldx { template <typename C> static void apply(C &c, std::uint8_t v) { c.x = v; set_nz(c.p, v); } };
-struct Ldy { template <typename C> static void apply(C &c, std::uint8_t v) { c.y = v; set_nz(c.p, v); } };
+[[gnu::always_inline]] inline auto set_flag(Registers &r, std::uint8_t bit, bool on) -> void
+{
+    r.p = static_cast<std::uint8_t>(on ? (r.p | bit) : (r.p & ~bit));
+}
 
-struct And { template <typename C> static void apply(C &c, std::uint8_t v) { c.a = static_cast<std::uint8_t>(c.a & v); set_nz(c.p, c.a); } };
-struct Ora { template <typename C> static void apply(C &c, std::uint8_t v) { c.a = static_cast<std::uint8_t>(c.a | v); set_nz(c.p, c.a); } };
-struct Eor { template <typename C> static void apply(C &c, std::uint8_t v) { c.a = static_cast<std::uint8_t>(c.a ^ v); set_nz(c.p, c.a); } };
+// Op classes — each takes Registers& and returns void (or a byte for stores/
+// RMW, or a bool for branch conds).
+
+// ---- Read ops ----
+struct Lda { static void apply(Registers &r, std::uint8_t v) { r.a = v; set_nz(r, v); } };
+struct Ldx { static void apply(Registers &r, std::uint8_t v) { r.x = v; set_nz(r, v); } };
+struct Ldy { static void apply(Registers &r, std::uint8_t v) { r.y = v; set_nz(r, v); } };
+
+struct And { static void apply(Registers &r, std::uint8_t v) { r.a = static_cast<std::uint8_t>(r.a & v); set_nz(r, r.a); } };
+struct Ora { static void apply(Registers &r, std::uint8_t v) { r.a = static_cast<std::uint8_t>(r.a | v); set_nz(r, r.a); } };
+struct Eor { static void apply(Registers &r, std::uint8_t v) { r.a = static_cast<std::uint8_t>(r.a ^ v); set_nz(r, r.a); } };
 
 struct Bit {
-    template <typename C> static void apply(C &c, std::uint8_t v)
+    static void apply(Registers &r, std::uint8_t v)
     {
-        set_flag(c.p, flag::N, (v & 0x80) != 0);
-        set_flag(c.p, flag::V, (v & 0x40) != 0);
-        set_flag(c.p, flag::Z, (c.a & v) == 0);
+        set_flag(r, flag::N, (v & 0x80) != 0);
+        set_flag(r, flag::V, (v & 0x40) != 0);
+        set_flag(r, flag::Z, (r.a & v) == 0);
     }
 };
 
 // Compares: reg - v, set N/Z from result; C = (reg >= v).
-struct Cmp { template <typename C> static void apply(C &c, std::uint8_t v) { auto r = static_cast<std::uint8_t>(c.a - v); set_nz(c.p, r); set_flag(c.p, flag::C, c.a >= v); } };
-struct Cpx { template <typename C> static void apply(C &c, std::uint8_t v) { auto r = static_cast<std::uint8_t>(c.x - v); set_nz(c.p, r); set_flag(c.p, flag::C, c.x >= v); } };
-struct Cpy { template <typename C> static void apply(C &c, std::uint8_t v) { auto r = static_cast<std::uint8_t>(c.y - v); set_nz(c.p, r); set_flag(c.p, flag::C, c.y >= v); } };
+struct Cmp { static void apply(Registers &r, std::uint8_t v) { auto d = static_cast<std::uint8_t>(r.a - v); set_nz(r, d); set_flag(r, flag::C, r.a >= v); } };
+struct Cpx { static void apply(Registers &r, std::uint8_t v) { auto d = static_cast<std::uint8_t>(r.x - v); set_nz(r, d); set_flag(r, flag::C, r.x >= v); } };
+struct Cpy { static void apply(Registers &r, std::uint8_t v) { auto d = static_cast<std::uint8_t>(r.y - v); set_nz(r, d); set_flag(r, flag::C, r.y >= v); } };
 
 // ADC / SBC — binary path always exists; decimal path taken when D is set.
-// Public `apply_binary` / `apply_decimal` so SLO/RLA/etc. and SBC can reuse
-// the binary path directly.
 struct Adc {
-    template <typename C> static void apply_binary(C &c, std::uint8_t v)
+    static void apply_binary(Registers &r, std::uint8_t v)
     {
-        unsigned a = c.a, m = v, cin = (c.p & flag::C) ? 1u : 0u;
+        unsigned a = r.a, m = v, cin = (r.p & flag::C) ? 1u : 0u;
         unsigned sum = a + m + cin;
         bool vflg = ((~(a ^ m) & (a ^ sum)) & 0x80u) != 0;
-        c.a = static_cast<std::uint8_t>(sum);
-        set_nz(c.p, c.a);
-        set_flag(c.p, flag::C, sum > 0xFFu);
-        set_flag(c.p, flag::V, vflg);
+        r.a = static_cast<std::uint8_t>(sum);
+        set_nz(r, r.a);
+        set_flag(r, flag::C, sum > 0xFFu);
+        set_flag(r, flag::V, vflg);
     }
-    template <typename C> static void apply_decimal(C &c, std::uint8_t v)
+    static void apply_decimal(Registers &r, std::uint8_t v)
     {
-        // NMOS 6502 decimal ADC: N/V flags reflect the binary calculation's
-        // result, while A and C reflect the BCD-adjusted sum.
-        unsigned a = c.a, m = v, cin = (c.p & flag::C) ? 1u : 0u;
+        // NMOS 6502 decimal ADC: N/V flags reflect the binary calculation;
+        // A and C reflect the BCD-adjusted sum.
+        unsigned a = r.a, m = v, cin = (r.p & flag::C) ? 1u : 0u;
         unsigned bin_sum = a + m + cin;
-        set_flag(c.p, flag::Z, (bin_sum & 0xFFu) == 0);
+        set_flag(r, flag::Z, (bin_sum & 0xFFu) == 0);
         unsigned lo = (a & 0x0Fu) + (m & 0x0Fu) + cin;
         if (lo > 0x09u) lo += 0x06u;
         unsigned sum = (a & 0xF0u) + (m & 0xF0u) + (lo > 0x0Fu ? 0x10u : 0u) + (lo & 0x0Fu);
-        set_flag(c.p, flag::N, (sum & 0x80u) != 0);
-        set_flag(c.p, flag::V, ((~(a ^ m) & (a ^ sum)) & 0x80u) != 0);
+        set_flag(r, flag::N, (sum & 0x80u) != 0);
+        set_flag(r, flag::V, ((~(a ^ m) & (a ^ sum)) & 0x80u) != 0);
         if (sum > 0x9Fu) sum += 0x60u;
-        set_flag(c.p, flag::C, sum > 0xFFu);
-        c.a = static_cast<std::uint8_t>(sum);
+        set_flag(r, flag::C, sum > 0xFFu);
+        r.a = static_cast<std::uint8_t>(sum);
     }
-    template <typename C> static void apply(C &c, std::uint8_t v)
+    static void apply(Registers &r, std::uint8_t v)
     {
-        if (c.p & flag::D) apply_decimal(c, v);
-        else               apply_binary (c, v);
+        if (r.p & flag::D) apply_decimal(r, v);
+        else               apply_binary (r, v);
     }
 };
 struct Sbc {
-    template <typename C> static void apply_binary(C &c, std::uint8_t v)
+    static void apply_binary(Registers &r, std::uint8_t v)
     {
-        Adc::apply_binary(c, static_cast<std::uint8_t>(~v));
+        Adc::apply_binary(r, static_cast<std::uint8_t>(~v));
     }
-    template <typename C> static void apply_decimal(C &c, std::uint8_t v)
+    static void apply_decimal(Registers &r, std::uint8_t v)
     {
-        // NMOS 6502 decimal SBC: N/V/Z/C flags reflect the binary calculation;
-        // A reflects the BCD-adjusted difference.
-        unsigned a = c.a, m = v, cin = (c.p & flag::C) ? 1u : 0u;
+        unsigned a = r.a, m = v, cin = (r.p & flag::C) ? 1u : 0u;
         unsigned bin = (a - m - (1u - cin)) & 0xFFFFu;
-        set_flag(c.p, flag::Z, (bin & 0xFFu) == 0);
-        set_flag(c.p, flag::N, (bin & 0x80u) != 0);
-        set_flag(c.p, flag::V, (((a ^ m) & (a ^ bin)) & 0x80u) != 0);
-        set_flag(c.p, flag::C, bin < 0x100u);
+        set_flag(r, flag::Z, (bin & 0xFFu) == 0);
+        set_flag(r, flag::N, (bin & 0x80u) != 0);
+        set_flag(r, flag::V, (((a ^ m) & (a ^ bin)) & 0x80u) != 0);
+        set_flag(r, flag::C, bin < 0x100u);
         unsigned lo = (a & 0x0Fu) - (m & 0x0Fu) - (1u - cin);
         unsigned result;
         if (lo & 0x10u) {
@@ -197,113 +191,113 @@ struct Sbc {
             result = (lo & 0x0Fu) | (((a & 0xF0u) - (m & 0xF0u)) & 0xFFF0u);
         }
         if (result & 0x100u) result -= 0x60u;
-        c.a = static_cast<std::uint8_t>(result);
+        r.a = static_cast<std::uint8_t>(result);
     }
-    template <typename C> static void apply(C &c, std::uint8_t v)
+    static void apply(Registers &r, std::uint8_t v)
     {
-        if (c.p & flag::D) apply_decimal(c, v);
-        else               apply_binary (c, v);
+        if (r.p & flag::D) apply_decimal(r, v);
+        else               apply_binary (r, v);
     }
 };
 
-// ---- Store ops (return a byte to write to memory) ----
-struct Sta { template <typename C> static auto value(const C &c) -> std::uint8_t { return c.a; } };
-struct Stx { template <typename C> static auto value(const C &c) -> std::uint8_t { return c.x; } };
-struct Sty { template <typename C> static auto value(const C &c) -> std::uint8_t { return c.y; } };
-// SAX stores A & X (illegal but stable).
-struct Sax { template <typename C> static auto value(const C &c) -> std::uint8_t { return static_cast<std::uint8_t>(c.a & c.x); } };
+// ---- Store ops (return the byte to write) ----
+struct Sta { static auto value(const Registers &r) -> std::uint8_t { return r.a; } };
+struct Stx { static auto value(const Registers &r) -> std::uint8_t { return r.x; } };
+struct Sty { static auto value(const Registers &r) -> std::uint8_t { return r.y; } };
+// SAX (illegal stable): store A & X.
+struct Sax { static auto value(const Registers &r) -> std::uint8_t { return static_cast<std::uint8_t>(r.a & r.x); } };
 
-// ---- Stack push/pull ops. Use the same shape as Store/Read ops — `value`
-// returns the byte to push, `apply(cpu, v)` consumes the pulled byte.
-struct Pha { template <typename C> static auto value(const C &c) -> std::uint8_t { return c.a; } };
-// PHP always pushes with B and U set (those bits are only meaningful on the stack).
-struct Php { template <typename C> static auto value(const C &c) -> std::uint8_t { return static_cast<std::uint8_t>(c.p | flag::B | flag::U); } };
-struct Pla { template <typename C> static void apply(C &c, std::uint8_t v) { c.a = v; set_nz(c.p, v); } };
-// PLP: strip B, ensure U (they're stack-only bits).
-struct Plp { template <typename C> static void apply(C &c, std::uint8_t v) { c.p = static_cast<std::uint8_t>((v & ~flag::B) | flag::U); } };
+// ---- Push / Pull ----
+struct Pha { static auto value(const Registers &r) -> std::uint8_t { return r.a; } };
+// PHP pushes P with B and U set (stack-only bits).
+struct Php { static auto value(const Registers &r) -> std::uint8_t { return static_cast<std::uint8_t>(r.p | flag::B | flag::U); } };
+struct Pla { static void apply(Registers &r, std::uint8_t v) { r.a = v; set_nz(r, v); } };
+// PLP: strip B, ensure U.
+struct Plp { static void apply(Registers &r, std::uint8_t v) { r.p = static_cast<std::uint8_t>((v & ~flag::B) | flag::U); } };
 
-// ---- Implied ops (operate on registers only) ----
+// ---- Implied ops ----
 struct Nop {
-    template <typename C> static void apply(C &) {}
-    // Overload for read-addressing illegal NOPs: fetch happens, result is
-    // discarded, no CPU state changes.
-    template <typename C> static void apply(C &, std::uint8_t) {}
+    static void apply(Registers &) {}
+    // Overload for read-addressing illegal NOPs.
+    static void apply(Registers &, std::uint8_t) {}
 };
-struct Inx { template <typename C> static void apply(C &c) { c.x = static_cast<std::uint8_t>(c.x + 1); set_nz(c.p, c.x); } };
-struct Iny { template <typename C> static void apply(C &c) { c.y = static_cast<std::uint8_t>(c.y + 1); set_nz(c.p, c.y); } };
-struct Dex { template <typename C> static void apply(C &c) { c.x = static_cast<std::uint8_t>(c.x - 1); set_nz(c.p, c.x); } };
-struct Dey { template <typename C> static void apply(C &c) { c.y = static_cast<std::uint8_t>(c.y - 1); set_nz(c.p, c.y); } };
-struct Tax { template <typename C> static void apply(C &c) { c.x = c.a; set_nz(c.p, c.x); } };
-struct Tay { template <typename C> static void apply(C &c) { c.y = c.a; set_nz(c.p, c.y); } };
-struct Tsx { template <typename C> static void apply(C &c) { c.x = c.s; set_nz(c.p, c.x); } };
-struct Txa { template <typename C> static void apply(C &c) { c.a = c.x; set_nz(c.p, c.a); } };
-struct Txs { template <typename C> static void apply(C &c) { c.s = c.x; /* TXS does NOT set flags */ } };
-struct Tya { template <typename C> static void apply(C &c) { c.a = c.y; set_nz(c.p, c.a); } };
-struct Clc { template <typename C> static void apply(C &c) { set_flag(c.p, flag::C, false); } };
-struct Sec { template <typename C> static void apply(C &c) { set_flag(c.p, flag::C, true); } };
-struct Cli { template <typename C> static void apply(C &c) { set_flag(c.p, flag::I, false); } };
-struct Sei { template <typename C> static void apply(C &c) { set_flag(c.p, flag::I, true); } };
-struct Clv { template <typename C> static void apply(C &c) { set_flag(c.p, flag::V, false); } };
-struct Cld { template <typename C> static void apply(C &c) { set_flag(c.p, flag::D, false); } };
-struct Sed { template <typename C> static void apply(C &c) { set_flag(c.p, flag::D, true); } };
+struct Inx { static void apply(Registers &r) { r.x = static_cast<std::uint8_t>(r.x + 1); set_nz(r, r.x); } };
+struct Iny { static void apply(Registers &r) { r.y = static_cast<std::uint8_t>(r.y + 1); set_nz(r, r.y); } };
+struct Dex { static void apply(Registers &r) { r.x = static_cast<std::uint8_t>(r.x - 1); set_nz(r, r.x); } };
+struct Dey { static void apply(Registers &r) { r.y = static_cast<std::uint8_t>(r.y - 1); set_nz(r, r.y); } };
+struct Tax { static void apply(Registers &r) { r.x = r.a; set_nz(r, r.x); } };
+struct Tay { static void apply(Registers &r) { r.y = r.a; set_nz(r, r.y); } };
+struct Tsx { static void apply(Registers &r) { r.x = r.s; set_nz(r, r.x); } };
+struct Txa { static void apply(Registers &r) { r.a = r.x; set_nz(r, r.a); } };
+// TXS does NOT set flags.
+struct Txs { static void apply(Registers &r) { r.s = r.x; } };
+struct Tya { static void apply(Registers &r) { r.a = r.y; set_nz(r, r.a); } };
+struct Clc { static void apply(Registers &r) { set_flag(r, flag::C, false); } };
+struct Sec { static void apply(Registers &r) { set_flag(r, flag::C, true); } };
+struct Cli { static void apply(Registers &r) { set_flag(r, flag::I, false); } };
+struct Sei { static void apply(Registers &r) { set_flag(r, flag::I, true); } };
+struct Clv { static void apply(Registers &r) { set_flag(r, flag::V, false); } };
+struct Cld { static void apply(Registers &r) { set_flag(r, flag::D, false); } };
+struct Sed { static void apply(Registers &r) { set_flag(r, flag::D, true); } };
 
-// ---- RMW ops (read a value, return the modified value) ----
-struct Asl { template <typename C> static auto apply(C &c, std::uint8_t v) -> std::uint8_t { set_flag(c.p, flag::C, (v & 0x80) != 0); auto r = static_cast<std::uint8_t>(v << 1); set_nz(c.p, r); return r; } };
-struct Lsr { template <typename C> static auto apply(C &c, std::uint8_t v) -> std::uint8_t { set_flag(c.p, flag::C, (v & 0x01) != 0); auto r = static_cast<std::uint8_t>(v >> 1); set_nz(c.p, r); return r; } };
-struct Rol { template <typename C> static auto apply(C &c, std::uint8_t v) -> std::uint8_t { auto cin = (c.p & flag::C) ? 1u : 0u; set_flag(c.p, flag::C, (v & 0x80) != 0); auto r = static_cast<std::uint8_t>((v << 1) | cin); set_nz(c.p, r); return r; } };
-struct Ror { template <typename C> static auto apply(C &c, std::uint8_t v) -> std::uint8_t { auto cin = (c.p & flag::C) ? 0x80u : 0u; set_flag(c.p, flag::C, (v & 0x01) != 0); auto r = static_cast<std::uint8_t>((v >> 1) | cin); set_nz(c.p, r); return r; } };
-struct Inc { template <typename C> static auto apply(C &c, std::uint8_t v) -> std::uint8_t { auto r = static_cast<std::uint8_t>(v + 1); set_nz(c.p, r); return r; } };
-struct Dec { template <typename C> static auto apply(C &c, std::uint8_t v) -> std::uint8_t { auto r = static_cast<std::uint8_t>(v - 1); set_nz(c.p, r); return r; } };
+// ---- RMW ops — take v, return new memory byte, mutate r.p. Illegal
+// variants (SLO/RLA/...) also mutate r.a via the secondary ALU op.
+struct Asl { static auto apply(Registers &r, std::uint8_t v) -> std::uint8_t { set_flag(r, flag::C, (v & 0x80) != 0); auto res = static_cast<std::uint8_t>(v << 1); set_nz(r, res); return res; } };
+struct Lsr { static auto apply(Registers &r, std::uint8_t v) -> std::uint8_t { set_flag(r, flag::C, (v & 0x01) != 0); auto res = static_cast<std::uint8_t>(v >> 1); set_nz(r, res); return res; } };
+struct Rol { static auto apply(Registers &r, std::uint8_t v) -> std::uint8_t { auto cin = (r.p & flag::C) ? 1u : 0u; set_flag(r, flag::C, (v & 0x80) != 0); auto res = static_cast<std::uint8_t>((v << 1) | cin); set_nz(r, res); return res; } };
+struct Ror { static auto apply(Registers &r, std::uint8_t v) -> std::uint8_t { auto cin = (r.p & flag::C) ? 0x80u : 0u; set_flag(r, flag::C, (v & 0x01) != 0); auto res = static_cast<std::uint8_t>((v >> 1) | cin); set_nz(r, res); return res; } };
+struct Inc { static auto apply(Registers &r, std::uint8_t v) -> std::uint8_t { auto res = static_cast<std::uint8_t>(v + 1); set_nz(r, res); return res; } };
+struct Dec { static auto apply(Registers &r, std::uint8_t v) -> std::uint8_t { auto res = static_cast<std::uint8_t>(v - 1); set_nz(r, res); return res; } };
 
 // ---- Branch conditions ----
-struct BplCond { template <typename C> static auto taken(const C &c) -> bool { return (c.p & flag::N) == 0; } };
-struct BmiCond { template <typename C> static auto taken(const C &c) -> bool { return (c.p & flag::N) != 0; } };
-struct BvcCond { template <typename C> static auto taken(const C &c) -> bool { return (c.p & flag::V) == 0; } };
-struct BvsCond { template <typename C> static auto taken(const C &c) -> bool { return (c.p & flag::V) != 0; } };
-struct BccCond { template <typename C> static auto taken(const C &c) -> bool { return (c.p & flag::C) == 0; } };
-struct BcsCond { template <typename C> static auto taken(const C &c) -> bool { return (c.p & flag::C) != 0; } };
-struct BneCond { template <typename C> static auto taken(const C &c) -> bool { return (c.p & flag::Z) == 0; } };
-struct BeqCond { template <typename C> static auto taken(const C &c) -> bool { return (c.p & flag::Z) != 0; } };
+struct BplCond { static auto taken(const Registers &r) -> bool { return (r.p & flag::N) == 0; } };
+struct BmiCond { static auto taken(const Registers &r) -> bool { return (r.p & flag::N) != 0; } };
+struct BvcCond { static auto taken(const Registers &r) -> bool { return (r.p & flag::V) == 0; } };
+struct BvsCond { static auto taken(const Registers &r) -> bool { return (r.p & flag::V) != 0; } };
+struct BccCond { static auto taken(const Registers &r) -> bool { return (r.p & flag::C) == 0; } };
+struct BcsCond { static auto taken(const Registers &r) -> bool { return (r.p & flag::C) != 0; } };
+struct BneCond { static auto taken(const Registers &r) -> bool { return (r.p & flag::Z) == 0; } };
+struct BeqCond { static auto taken(const Registers &r) -> bool { return (r.p & flag::Z) != 0; } };
 
 // ---- Stable illegal ops combining legal ones ----
-// LAX = LDA + LDX (read).
-struct Lax { template <typename C> static void apply(C &c, std::uint8_t v) { c.a = v; c.x = v; set_nz(c.p, v); } };
-// SLO, RLA, SRE, RRA, DCP, ISC: RMW → combined second op applied to A.
-struct Slo { template <typename C> static auto apply(C &c, std::uint8_t v) -> std::uint8_t { auto r = Asl::apply(c, v); Ora::apply(c, r); return r; } };
-struct Rla { template <typename C> static auto apply(C &c, std::uint8_t v) -> std::uint8_t { auto r = Rol::apply(c, v); And::apply(c, r); return r; } };
-struct Sre { template <typename C> static auto apply(C &c, std::uint8_t v) -> std::uint8_t { auto r = Lsr::apply(c, v); Eor::apply(c, r); return r; } };
-struct Rra { template <typename C> static auto apply(C &c, std::uint8_t v) -> std::uint8_t { auto r = Ror::apply(c, v); Adc::apply(c, r); return r; } };
-struct Dcp { template <typename C> static auto apply(C &c, std::uint8_t v) -> std::uint8_t { auto r = Dec::apply(c, v); Cmp::apply(c, r); return r; } };
-struct Isc { template <typename C> static auto apply(C &c, std::uint8_t v) -> std::uint8_t { auto r = Inc::apply(c, v); Sbc::apply(c, r); return r; } };
+// LAX = LDA + LDX.
+struct Lax { static void apply(Registers &r, std::uint8_t v) { r.a = v; r.x = v; set_nz(r, v); } };
+// SLO/RLA/SRE/RRA/DCP/ISC: RMW primary + second ALU op on A.
+struct Slo { static auto apply(Registers &r, std::uint8_t v) -> std::uint8_t { auto res = Asl::apply(r, v); Ora::apply(r, res); return res; } };
+struct Rla { static auto apply(Registers &r, std::uint8_t v) -> std::uint8_t { auto res = Rol::apply(r, v); And::apply(r, res); return res; } };
+struct Sre { static auto apply(Registers &r, std::uint8_t v) -> std::uint8_t { auto res = Lsr::apply(r, v); Eor::apply(r, res); return res; } };
+struct Rra { static auto apply(Registers &r, std::uint8_t v) -> std::uint8_t { auto res = Ror::apply(r, v); Adc::apply(r, res); return res; } };
+struct Dcp { static auto apply(Registers &r, std::uint8_t v) -> std::uint8_t { auto res = Dec::apply(r, v); Cmp::apply(r, res); return res; } };
+struct Isc { static auto apply(Registers &r, std::uint8_t v) -> std::uint8_t { auto res = Inc::apply(r, v); Sbc::apply(r, res); return res; } };
 
 // Immediate-only illegals.
-struct Anc { template <typename C> static void apply(C &c, std::uint8_t v) { And::apply(c, v); set_flag(c.p, flag::C, (c.a & 0x80) != 0); } };
-struct Alr { template <typename C> static void apply(C &c, std::uint8_t v) { And::apply(c, v); c.a = Lsr::apply(c, c.a); } };
-// ARR: A = ((A & v) >> 1) | (C << 7), then set flags with the weird ARR rule.
+struct Anc { static void apply(Registers &r, std::uint8_t v) { And::apply(r, v); set_flag(r, flag::C, (r.a & 0x80) != 0); } };
+struct Alr { static void apply(Registers &r, std::uint8_t v) { And::apply(r, v); r.a = Lsr::apply(r, r.a); } };
+// ARR: A = ((A & v) >> 1) | (C << 7), with the ARR-specific V/C rule.
 struct Arr {
-    template <typename C> static void apply(C &c, std::uint8_t v)
+    static void apply(Registers &r, std::uint8_t v)
     {
-        And::apply(c, v);
-        auto cin = (c.p & flag::C) ? 0x80u : 0u;
-        c.a = static_cast<std::uint8_t>((c.a >> 1) | cin);
-        set_nz(c.p, c.a);
-        set_flag(c.p, flag::C, (c.a & 0x40) != 0);
-        set_flag(c.p, flag::V, ((c.a >> 5) ^ (c.a >> 6)) & 0x01);
+        And::apply(r, v);
+        auto cin = (r.p & flag::C) ? 0x80u : 0u;
+        r.a = static_cast<std::uint8_t>((r.a >> 1) | cin);
+        set_nz(r, r.a);
+        set_flag(r, flag::C, (r.a & 0x40) != 0);
+        set_flag(r, flag::V, ((r.a >> 5) ^ (r.a >> 6)) & 0x01);
     }
 };
-// AXS: X = (A & X) - imm. Sets C/N/Z as if compare.
+// AXS: X = (A & X) - imm. Flags as CMP.
 struct Axs {
-    template <typename C> static void apply(C &c, std::uint8_t v)
+    static void apply(Registers &r, std::uint8_t v)
     {
-        auto ax = static_cast<std::uint8_t>(c.a & c.x);
-        auto r  = static_cast<std::uint8_t>(ax - v);
-        set_nz(c.p, r);
-        set_flag(c.p, flag::C, ax >= v);
-        c.x = r;
+        auto ax  = static_cast<std::uint8_t>(r.a & r.x);
+        auto res = static_cast<std::uint8_t>(ax - v);
+        set_nz(r, res);
+        set_flag(r, flag::C, ax >= v);
+        r.x = res;
     }
 };
-// USBC is undocumented but bit-equivalent to SBC.
-struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sbc::apply(c, v); } };
+// USBC: bit-equivalent to SBC.
+struct Usbc { static void apply(Registers &r, std::uint8_t v) { Sbc::apply(r, v); } };
 
 }  // namespace detail
 
@@ -335,7 +329,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 // Shorthand: set the next phi2 to a stack access at the current S, then run
 // the standard step tail. Used all over BRK/JSR/RTS/RTI/PHA/PHP/PLA/PLP.
 #define TAWNY_NEXT_STACK(NEXT_TST)                                            \
-    addr = static_cast<std::uint16_t>(0x0100u | s);                     \
+    addr = static_cast<std::uint16_t>(0x0100u | r.s);                     \
     TAWNY_STEP_TAIL(access_cost_stack(s), (NEXT_TST))
 
 // Shorthand: set the next phi2 to an opcode fetch at PC, then run the tail.
@@ -366,7 +360,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 #define TAWNY_IMPLIED(OPCODE, OP_CLASS)                                    \
     case ((OPCODE) << 3) | 0: {                                            \
         (void)config.read(addr);                                           \
-        OP_CLASS::apply(view);                                            \
+        OP_CLASS::apply(r);                                            \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -378,7 +372,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 #define TAWNY_IMM_READ(OPCODE, OP_CLASS)                                   \
     case ((OPCODE) << 3) | 0: {                                            \
         pc = static_cast<std::uint16_t>(pc + 1);               \
-        OP_CLASS::apply(view, config.read(addr));                         \
+        OP_CLASS::apply(r, config.read(addr));                         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -398,7 +392,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        OP_CLASS::apply(view,                                             \
+        OP_CLASS::apply(r,                                             \
             config.read_zp(static_cast<std::uint8_t>(addr)));              \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                      \
     }                                                                      \
@@ -420,7 +414,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
         config.write_zp(static_cast<std::uint8_t>(addr),                   \
-                        OP_CLASS::value(view));                           \
+                        OP_CLASS::value(r));                           \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -449,7 +443,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        OP_CLASS::apply(view, config.read(addr));                         \
+        OP_CLASS::apply(r, config.read(addr));                         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -496,7 +490,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        config.write(addr, OP_CLASS::value(view));                        \
+        config.write(addr, OP_CLASS::value(r));                        \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -521,7 +515,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        OP_CLASS::apply(view,                                             \
+        OP_CLASS::apply(r,                                             \
             config.read_zp(static_cast<std::uint8_t>(addr)));              \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                      \
     }                                                                      \
@@ -546,16 +540,16 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
         config.write_zp(static_cast<std::uint8_t>(addr),                   \
-                        OP_CLASS::value(view));                           \
+                        OP_CLASS::value(r));                           \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
 
-#define TAWNY_ZPX_READ(OPCODE, OP_CLASS)  TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, x)
-#define TAWNY_ZPY_READ(OPCODE, OP_CLASS)  TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, y)
-#define TAWNY_ZPX_WRITE(OPCODE, OP_CLASS) TAWNY_ZP_INDEXED_WRITE(OPCODE, OP_CLASS, x)
-#define TAWNY_ZPY_WRITE(OPCODE, OP_CLASS) TAWNY_ZP_INDEXED_WRITE(OPCODE, OP_CLASS, y)
+#define TAWNY_ZPX_READ(OPCODE, OP_CLASS)  TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, r.x)
+#define TAWNY_ZPY_READ(OPCODE, OP_CLASS)  TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, r.y)
+#define TAWNY_ZPX_WRITE(OPCODE, OP_CLASS) TAWNY_ZP_INDEXED_WRITE(OPCODE, OP_CLASS, r.x)
+#define TAWNY_ZPY_WRITE(OPCODE, OP_CLASS) TAWNY_ZP_INDEXED_WRITE(OPCODE, OP_CLASS, r.y)
 
 // ABS_INDEXED_READ — 4 or 5 cycles. Optimistic path: if base_lo + IDX didn't
 // carry, the "wrong" address with the un-carried high byte is actually
@@ -592,7 +586,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
-        OP_CLASS::apply(view, config.read(addr));                         \
+        OP_CLASS::apply(r, config.read(addr));                         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -627,16 +621,16 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
-        config.write(addr, OP_CLASS::value(view));                        \
+        config.write(addr, OP_CLASS::value(r));                        \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 4)
 
-#define TAWNY_ABX_READ(OPCODE, OP_CLASS)  TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, x)
-#define TAWNY_ABY_READ(OPCODE, OP_CLASS)  TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, y)
-#define TAWNY_ABX_WRITE(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_WRITE(OPCODE, OP_CLASS, x)
-#define TAWNY_ABY_WRITE(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_WRITE(OPCODE, OP_CLASS, y)
+#define TAWNY_ABX_READ(OPCODE, OP_CLASS)  TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, r.x)
+#define TAWNY_ABY_READ(OPCODE, OP_CLASS)  TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, r.y)
+#define TAWNY_ABX_WRITE(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_WRITE(OPCODE, OP_CLASS, r.x)
+#define TAWNY_ABY_WRITE(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_WRITE(OPCODE, OP_CLASS, r.y)
 
 // IZX (indirect,X) read/write — 6 cycles. ZP index with X, then fetch 2-byte
 // pointer from ZP (wrapping in ZP), then read/write from target.
@@ -645,7 +639,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
         pc = static_cast<std::uint16_t>(pc + 1);               \
         auto _zp = config.read(addr);                                      \
         base = static_cast<std::uint16_t>(                                 \
-            static_cast<std::uint8_t>(_zp + x));                     \
+            static_cast<std::uint8_t>(_zp + r.x));                     \
         addr = static_cast<std::uint16_t>(_zp);                            \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 1);                              \
@@ -675,7 +669,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
-        OP_CLASS::apply(view, config.read(addr));                         \
+        OP_CLASS::apply(r, config.read(addr));                         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -686,7 +680,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
         pc = static_cast<std::uint16_t>(pc + 1);               \
         auto _zp = config.read(addr);                                      \
         base = static_cast<std::uint16_t>(                                 \
-            static_cast<std::uint8_t>(_zp + x));                     \
+            static_cast<std::uint8_t>(_zp + r.x));                     \
         addr = static_cast<std::uint16_t>(_zp);                            \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 1);                              \
@@ -716,7 +710,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
-        config.write(addr, OP_CLASS::value(view));                        \
+        config.write(addr, OP_CLASS::value(r));                        \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -742,7 +736,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
         auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));    \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + y);  \
+        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);  \
         addr = static_cast<std::uint16_t>(                                 \
             (_hi << 8) | (_lo_sum & 0x00FFu));                             \
         if (_lo_sum > 0xFFu) {                                             \
@@ -761,7 +755,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
-        OP_CLASS::apply(view, config.read(addr));                         \
+        OP_CLASS::apply(r, config.read(addr));                         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -785,7 +779,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
         auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));    \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + y);  \
+        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);  \
         addr = static_cast<std::uint16_t>(                                 \
             (_hi << 8) | (_lo_sum & 0x00FFu));                             \
         base = static_cast<std::uint16_t>(                                 \
@@ -801,7 +795,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
-        config.write(addr, OP_CLASS::value(view));                        \
+        config.write(addr, OP_CLASS::value(r));                        \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -812,7 +806,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
 #define TAWNY_ACC_RMW(OPCODE, OP_CLASS)                                    \
     case ((OPCODE) << 3) | 0: {                                            \
         (void)config.read(addr);                                           \
-        a = OP_CLASS::apply(view, a);                         \
+        r.a = OP_CLASS::apply(r, r.a);                         \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -839,7 +833,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     case ((OPCODE) << 3) | 2: {                                            \
         config.write_zp(static_cast<std::uint8_t>(addr),                   \
                         static_cast<std::uint8_t>(base));                  \
-        base = OP_CLASS::apply(view, static_cast<std::uint8_t>(base));    \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));    \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 3);                              \
     }                                                                      \
@@ -863,7 +857,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     case ((OPCODE) << 3) | 1: {                                            \
         (void)config.read_zp(static_cast<std::uint8_t>(addr));             \
         addr = static_cast<std::uint16_t>(                                 \
-            static_cast<std::uint8_t>(addr + x));                    \
+            static_cast<std::uint8_t>(addr + r.x));                    \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 2);                              \
     }                                                                      \
@@ -877,7 +871,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     case ((OPCODE) << 3) | 3: {                                            \
         config.write_zp(static_cast<std::uint8_t>(addr),                   \
                         static_cast<std::uint8_t>(base));                  \
-        base = OP_CLASS::apply(view, static_cast<std::uint8_t>(base));    \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));    \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),   \
                         ((OPCODE) << 3) | 4);                              \
     }                                                                      \
@@ -913,7 +907,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
         config.write(addr, static_cast<std::uint8_t>(base));               \
-        base = OP_CLASS::apply(view, static_cast<std::uint8_t>(base));    \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));    \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);           \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -935,7 +929,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     case ((OPCODE) << 3) | 1: {                                            \
         pc = static_cast<std::uint16_t>(pc + 1);               \
         auto _hi     = config.read(addr);                                  \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + x);  \
+        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.x);  \
         addr = static_cast<std::uint16_t>(                                 \
             (_hi << 8) | (_lo_sum & 0x00FFu));                             \
         base = static_cast<std::uint16_t>(                                 \
@@ -957,7 +951,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
         config.write(addr, static_cast<std::uint8_t>(base));               \
-        base = OP_CLASS::apply(view, static_cast<std::uint8_t>(base));    \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));    \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);           \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -1015,19 +1009,19 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        (void)config.read_stack(s);                                  \
+        (void)config.read_stack(r.s);                                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        config.write_stack(s, static_cast<std::uint8_t>(pc >> 8)); \
-        s = static_cast<std::uint8_t>(s - 1);                  \
+        config.write_stack(r.s, static_cast<std::uint8_t>(pc >> 8)); \
+        r.s = static_cast<std::uint8_t>(r.s - 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
-        config.write_stack(s, static_cast<std::uint8_t>(pc));  \
-        s = static_cast<std::uint8_t>(s - 1);                  \
+        config.write_stack(r.s, static_cast<std::uint8_t>(pc));  \
+        r.s = static_cast<std::uint8_t>(r.s - 1);                  \
         addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);           \
     }                                                                      \
@@ -1050,21 +1044,21 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        (void)config.read_stack(s);                                  \
-        s = static_cast<std::uint8_t>(s + 1);                  \
+        (void)config.read_stack(r.s);                                  \
+        r.s = static_cast<std::uint8_t>(r.s + 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        base = config.read_stack(s);                                 \
-        s = static_cast<std::uint8_t>(s + 1);                  \
+        base = config.read_stack(r.s);                                 \
+        r.s = static_cast<std::uint8_t>(r.s + 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
         pc = static_cast<std::uint16_t>(                             \
             (base & 0x00FFu) |                                             \
-            (static_cast<std::uint16_t>(config.read_stack(s)) << 8));\
+            (static_cast<std::uint16_t>(config.read_stack(r.s)) << 8));\
         addr = pc;                                                   \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);           \
     }                                                                      \
@@ -1086,28 +1080,28 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        (void)config.read_stack(s);                                  \
-        s = static_cast<std::uint8_t>(s + 1);                  \
+        (void)config.read_stack(r.s);                                  \
+        r.s = static_cast<std::uint8_t>(r.s + 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        p = static_cast<std::uint8_t>(                               \
-            (config.read_stack(s) & ~flag::B) | flag::U);            \
-        s = static_cast<std::uint8_t>(s + 1);                  \
+        r.p = static_cast<std::uint8_t>(                               \
+            (config.read_stack(r.s) & ~flag::B) | flag::U);            \
+        r.s = static_cast<std::uint8_t>(r.s + 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 3: {                                            \
-        base = config.read_stack(s);                                 \
-        s = static_cast<std::uint8_t>(s + 1);                  \
+        base = config.read_stack(r.s);                                 \
+        r.s = static_cast<std::uint8_t>(r.s + 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 4);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 4: {                                            \
         pc = static_cast<std::uint16_t>(                             \
             (base & 0x00FFu) |                                             \
-            (static_cast<std::uint16_t>(config.read_stack(s)) << 8));\
+            (static_cast<std::uint16_t>(config.read_stack(r.s)) << 8));\
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -1122,8 +1116,8 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        config.write_stack(s, OP_CLASS::value(view));               \
-        s = static_cast<std::uint8_t>(s - 1);                  \
+        config.write_stack(r.s, OP_CLASS::value(r));               \
+        r.s = static_cast<std::uint8_t>(r.s - 1);                  \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -1138,13 +1132,13 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 1: {                                            \
-        (void)config.read_stack(s);                                  \
-        s = static_cast<std::uint8_t>(s + 1);                  \
+        (void)config.read_stack(r.s);                                  \
+        r.s = static_cast<std::uint8_t>(r.s + 1);                  \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                             \
     }                                                                      \
     [[fallthrough]];                                                       \
     case ((OPCODE) << 3) | 2: {                                            \
-        OP_CLASS::apply(view, config.read_stack(s));                \
+        OP_CLASS::apply(r, config.read_stack(r.s));                \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                      \
     }                                                                      \
     [[fallthrough]];                                                       \
@@ -1188,35 +1182,35 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 1: {                                               \
         if (brk_flags == BrkFlags::Reset) {                                   \
-            (void)config.read_stack(s);                                 \
+            (void)config.read_stack(r.s);                                 \
         } else {                                                              \
-            config.write_stack(s, static_cast<std::uint8_t>(pc >> 8)); \
+            config.write_stack(r.s, static_cast<std::uint8_t>(pc >> 8)); \
         }                                                                     \
-        s = static_cast<std::uint8_t>(s - 1);                     \
+        r.s = static_cast<std::uint8_t>(r.s - 1);                     \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                                \
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 2: {                                               \
         if (brk_flags == BrkFlags::Reset) {                                   \
-            (void)config.read_stack(s);                                 \
+            (void)config.read_stack(r.s);                                 \
         } else {                                                              \
-            config.write_stack(s, static_cast<std::uint8_t>(pc)); \
+            config.write_stack(r.s, static_cast<std::uint8_t>(pc)); \
         }                                                                     \
-        s = static_cast<std::uint8_t>(s - 1);                     \
+        r.s = static_cast<std::uint8_t>(r.s - 1);                     \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                                \
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
         if (brk_flags == BrkFlags::Reset) {                                   \
-            (void)config.read_stack(s);                                 \
+            (void)config.read_stack(r.s);                                 \
         } else {                                                              \
             std::uint8_t _pushed_p = (brk_flags == BrkFlags::None)            \
-                ? static_cast<std::uint8_t>(p | flag::B | flag::U)      \
-                : static_cast<std::uint8_t>(p | flag::U);               \
-            config.write_stack(s, _pushed_p);                           \
+                ? static_cast<std::uint8_t>(r.p | flag::B | flag::U)      \
+                : static_cast<std::uint8_t>(r.p | flag::U);               \
+            config.write_stack(r.s, _pushed_p);                           \
         }                                                                     \
-        s = static_cast<std::uint8_t>(s - 1);                     \
-        p = static_cast<std::uint8_t>(p | flag::I);               \
+        r.s = static_cast<std::uint8_t>(r.s - 1);                     \
+        r.p = static_cast<std::uint8_t>(r.p | flag::I);               \
         addr = (brk_flags == BrkFlags::Nmi)   ? 0xFFFAu                       \
              : (brk_flags == BrkFlags::Reset) ? 0xFFFCu                       \
              :                                  0xFFFEu;                      \
@@ -1253,7 +1247,7 @@ struct Usbc { template <typename C> static void apply(C &c, std::uint8_t v) { Sb
     case ((OPCODE) << 3) | 0: {                                            \
         pc = static_cast<std::uint16_t>(pc + 1);               \
         auto _off = static_cast<std::int8_t>(config.read(addr));           \
-        if (!COND::taken(view)) {                                         \
+        if (!COND::taken(r)) {                                         \
             tst = ((OPCODE) << 3) | 3;                                     \
             TAWNY_NEXT_OPCODE_FETCH(tst);                                  \
             break;                                                         \
@@ -1385,12 +1379,9 @@ struct M6502 {
         auto tst     = tstate;
         auto base    = base_addr;
         auto pc      = this->pc;   // shadow member so macros can write bare `pc`
-        auto a       = this->a;
-        auto x       = this->x;
-        auto y       = this->y;
-        auto s       = this->s;
-        auto p       = this->p;
-        detail::RegView view{a, x, y, s, p};  // refs to the locals; passed to op classes
+        // Single register-file local. Ops take it by reference and mutate
+        // fields in place — one aggregate, no pack/unpack at call sites.
+        auto r       = detail::Registers{this->a, this->x, this->y, this->s, this->p};
 
         while (current < horizon) {
             switch (tst) {
@@ -1703,12 +1694,12 @@ struct M6502 {
         pending_addr = addr;
         tstate       = tst;
         base_addr    = base;
-        this->pc     = pc;       // disambiguate: left-hand is the struct member
-        this->a      = a;
-        this->x      = x;
-        this->y      = y;
-        this->s      = s;
-        this->p      = p;
+        this->pc     = pc;
+        this->a      = r.a;
+        this->x      = r.x;
+        this->y      = r.y;
+        this->s      = r.s;
+        this->p      = r.p;
         return current;
     }
 };
