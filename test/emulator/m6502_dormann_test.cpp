@@ -9,6 +9,8 @@
 #include "emulator/m6502.h"
 #include "dormann/dormann_cpu_config.h"
 #include "dormann/functional_test_bin.h"
+#include "dormann/decimal_test_bin.h"
+#include "dormann/interrupt_test_bin.h"
 
 // Run the Klaus Dormann functional test end-to-end and profile the effective
 // clock speed over multiple runs. Compiled into the same test binary — run
@@ -67,4 +69,42 @@ TEST_CASE("Dormann: 6502 functional test passes + profile clock speed") {
         "  Avg wall time:    %.3f s\n"
         "  Effective clock:  %.2f MHz  (%.1fx a real 2 MHz 6502)\n\n",
         runs, avg_cycles, avg_seconds, mhz, mhz / 2.0);
+}
+
+// Bruce Clark's decimal-mode test. Sweeps all 2^16 operand pairs and both
+// carry values through ADC/SBC in decimal mode, comparing the accumulator
+// plus N/V/Z/C flags against values predicted in binary mode. Trap at
+// decimal::success_addr (= $025A) on pass; any other trapping pc is a
+// specific subtest failure (see the original source).
+TEST_CASE("Dormann: decimal-mode ADC/SBC test passes") {
+    tawny::dormann::DormannCpuConfig cfg{};
+    std::memcpy(
+        cfg.mem.get() + tawny::dormann::decimal::load_addr,
+        tawny::dormann::decimal::decimal_test_bin,
+        sizeof(tawny::dormann::decimal::decimal_test_bin));
+
+    tawny::M6502 cpu{std::move(cfg)};
+    cpu.set_pc(tawny::dormann::decimal::entry_addr);
+    (void)cpu.run_until(1ull << 40);
+
+    CHECK(cpu.pc == tawny::dormann::decimal::success_addr);
+}
+
+// Klaus Dormann's IRQ/NMI test. Requires the CPU's IRQ and NMI lines to be
+// wired up to a $BFFC feedback register — the DormannCpuConfig does not
+// provide that, and the M6502 core does not yet service interrupts, so this
+// test is expected to fail. Left disabled so the build stays green; enable
+// it (`-tc="Dormann: IRQ/NMI*"`) once interrupts land to watch it go green.
+TEST_CASE("Dormann: IRQ/NMI interrupt test passes" * doctest::skip()) {
+    tawny::dormann::DormannCpuConfig cfg{};
+    std::memcpy(
+        cfg.mem.get() + tawny::dormann::interrupt::load_addr,
+        tawny::dormann::interrupt::interrupt_test_bin,
+        sizeof(tawny::dormann::interrupt::interrupt_test_bin));
+
+    tawny::M6502 cpu{std::move(cfg)};
+    cpu.set_pc(tawny::dormann::interrupt::entry_addr);
+    (void)cpu.run_until(1ull << 40);
+
+    CHECK(cpu.pc == tawny::dormann::interrupt::success_addr);
 }

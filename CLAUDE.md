@@ -71,7 +71,7 @@ int compute(int x)
 - `src/emulator/` — Emulation core
   - `m6502.h` — MOS 6502 CPU: `M6502Config` concept, `M6502<Config>` template, full NMOS opcode set (all 151 legal + 93 illegal implemented; 12 true KIL/HLT opcodes and 5 SH*/TAS unstable variants left as JAM stubs). Deferred-sync architecture: `run_until(horizon)` runs until a simulated-time budget and resumes mid-instruction. Fall-through switch dispatch (one case = one cycle); hot legal opcodes frequency-sorted for i-cache locality; `set_pc(addr)` bootstrap path via synthetic tstate `0x7FF`.
 - `test/` — Heavyweight test files (compiled into the same executable)
-  - `test/dormann/` — Klaus Dormann functional test image + config + harness
+  - `test/dormann/` — Dormann / Bruce Clark test images + shared `DormannCpuConfig`. Three binaries: `functional_test_bin.h` (all-opcodes, profiled), `decimal_test_bin.h` (Bruce Clark decimal-mode ADC/SBC sweep), `interrupt_test_bin.h` (IRQ/NMI test — skipped until interrupts land; carries `feedback_port` / `feedback_*_bit` / `feedback_write_mask` MMIO constants for the eventual harness). Namespaced `tawny::dormann::{decimal,interrupt}`.
   - `test/emulator/` — CPU unit tests + functional-test profiling runner
 - `extern/` — Vendored dependencies (doctest, glad/)
 

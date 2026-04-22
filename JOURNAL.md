@@ -236,3 +236,28 @@ Captured in CLAUDE.md's "What still needs doing on the CPU core" section, summar
 - **SH* / TAS illegals** (5 opcodes) — tracked as a follow-up; minor since BBC Micro never used them.
 - **Public `reset()` mid-run** — a small addition if needed.
 - **RDY / SO pins, 65C02/65816** — out of scope for a BBC Micro NMOS emulator.
+
+## 2026-04-22 — Dormann decimal and interrupt test suites
+
+### What we did
+Added two more binaries from Klaus Dormann's / Bruce Clark's `6502_65C02_functional_tests` repo as doctest cases, alongside the existing functional test:
+
+- **`test/dormann/decimal_test_bin.h`** (322 bytes). Bruce Clark's decimal-mode test, assembled with `cputype=0, vld_bcd=0, chk_a=1, chk_n=1, chk_v=1, chk_z=1, chk_c=1`, and the `end_of_test` macro patched from `.byte $db` (65C02 STP) to `jmp *` so our existing "re-fetch-same-opcode" trap detector in `DormannCpuConfig` catches completion. Loads at `$0200`, enters at `$0200`, succeeds at `$025A`. Runs in ~62M cycles — sweeps all 2^16 operand pairs and both carry values through decimal ADC/SBC.
+- **`test/dormann/interrupt_test_bin.h`** (1007 bytes). Klaus Dormann's IRQ/NMI test, assembled with `load_data_direct=0` (others defaulted: `$BFFC` feedback port, IRQ on bit 0, NMI on bit 1, open-collector, NMOS decimal). Loads at `$0400`, enters at `$0400`, succeeds at `$0700`. Added a `test_success:` label immediately before the main `success` macro invocation in the ca65 source so the debug file lets us pin down the address without disassembling. Carries a block of `feedback_port` / `feedback_irq_bit` / `feedback_nmi_bit` / `feedback_write_mask` constants for the eventual harness that must wire the MMIO register to the IRQ and NMI lines.
+- Both headers use the existing `functional_test_bin.h` formatting (16 bytes / row, uppercase hex, load/entry/success constants, `inline constexpr std::uint8_t[]`) but live in nested `tawny::dormann::decimal` / `tawny::dormann::interrupt` namespaces so the three sets of constants don't collide in a single TU.
+- Two new `TEST_CASE`s in `test/emulator/m6502_dormann_test.cpp`. The decimal case runs as normal and passes. The interrupt case is marked `doctest::skip()` — the M6502 core doesn't service interrupts yet and the `DormannCpuConfig` doesn't model the `$BFFC` feedback register, so we'd just hit a trap at the first expected IRQ. It'll flip green once IRQ/NMI support lands.
+
+### Design decisions
+- **`end_of_test` patched instead of extending the trap detector.** Our trap heuristic is "two opcode fetches at the same PC" — perfect for `JMP *` / `BXX *`, blind to `$DB` (the 65C02 STP opcode). Patching the macro to `jmp *` is a one-line change in the source that keeps the host-side logic uniform across all three test binaries; extending the detector to also break on `$DB` would work but would bloat `access_cost_opcode` on the hot path for a single-use case.
+- **Nested sub-namespaces.** The original `functional_test_bin.h` puts `load_addr`/`entry_addr`/`success_addr` directly in `tawny::dormann`. Three sets of those under the same namespace would collide, so `decimal` and `interrupt` each get their own inner namespace. Left `functional_test_bin.h` alone for minimal diff; if the naming asymmetry starts to grate we can move the functional test into `tawny::dormann::functional` in a follow-up.
+- **`load_data_direct=0` for the interrupt test.** Same rationale as the original functional test: produces a contiguous CODE-only binary that loads into zero-init RAM with no need to set up vectors or data segments at known addresses. The test copies its own data / vectors at startup. Keeps the host harness trivial.
+- **Check in the generated headers, not the ca65 toolchain.** Matches the precedent set for `functional_test_bin.h` — the assembly step uses `ca65 + ld65`, which isn't a build dependency we want to push onto every checkout. Regeneration is a one-shot task captured in a separate script (lives in `/tmp/dormann-tests/` for now); the generated headers are the source of truth in the repo.
+- **Interrupt test skipped rather than expected-failing.** `doctest` supports `* doctest::should_fail()` which would run the test and treat a failure as success, but we know up-front the test will loop forever without a working IRQ hook, which would just burn the `run_until` horizon. Skipping keeps the test binary fast and leaves a clearly-named case to un-skip the day interrupts land.
+
+### MMIO contract for the interrupt test
+Captured as constants in `interrupt_test_bin.h` so we don't lose track before the harness exists:
+- `feedback_port = 0xBFFC` — single-byte read/write MMIO register.
+- Write semantics: latches the byte; bit 0 (inverted) drives IRQ, bit 1 (inverted) drives NMI. Open-collector / active-low — "set bit = line released, clear bit = line asserted".
+- Read semantics: returns the last latched value.
+- `feedback_write_mask = 0x7F` — bit 7 is filtered on write (used as a diag-stop in the original hardware variants; we drop it).
+- The test never touches DDR (`I_ddr = 0` in the source) and assumes `I_drive = 1` (open-collector).
