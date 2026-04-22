@@ -45,6 +45,11 @@ target_include_directories(tawny PRIVATE
 
 target_link_libraries(tawny PRIVATE glfw glad doctest)
 
+target_compile_options(tawny PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Werror>
+    $<$<CXX_COMPILER_ID:MSVC>:/W4 /WX>
+)
+
 # --- Post-build: run tests ---------------------------------------------------
 
 add_custom_command(TARGET tawny POST_BUILD

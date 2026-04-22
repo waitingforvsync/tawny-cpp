@@ -345,27 +345,27 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 // hasn't been hit; the next case's body runs in the same switch entry.
 // -----------------------------------------------------------------------------
 
-#define TAWNY_STEP_TAIL(COST_EXPR, NEXT_TST)            \
-    do {                                                \
-        auto _ac = config.COST_EXPR;                    \
-        current += _ac.cost;                            \
-        if (_ac.stop) horizon = current;                \
-        if (current >= horizon) {                       \
-            tst = static_cast<std::uint16_t>(NEXT_TST); \
-            goto exit;                                  \
-        }                                               \
+#define TAWNY_STEP_TAIL(COST_EXPR, NEXT_TST)                                  \
+    do {                                                                      \
+        auto _ac = config.COST_EXPR;                                          \
+        current += _ac.cost;                                                  \
+        if (_ac.stop) horizon = current;                                      \
+        if (current >= horizon) {                                             \
+            tst = static_cast<std::uint16_t>(NEXT_TST);                       \
+            goto exit;                                                        \
+        }                                                                     \
     } while (0)
 
 // Shorthand: set the next phi2 to a stack access at the current S, then run
 // the standard step tail. Used all over BRK/JSR/RTS/RTI/PHA/PHP/PLA/PLP.
-#define TAWNY_NEXT_STACK(NEXT_TST)                    \
-    addr = static_cast<std::uint16_t>(0x0100u | r.s); \
+#define TAWNY_NEXT_STACK(NEXT_TST)                                            \
+    addr = static_cast<std::uint16_t>(0x0100u | r.s);                         \
     TAWNY_STEP_TAIL(access_cost_stack(r.s), (NEXT_TST))
 
 // Shorthand: set the next phi2 to an opcode fetch at PC, then run the tail.
 // (Used at the end of every penultimate step.)
-#define TAWNY_NEXT_OPCODE_FETCH(NEXT_TST) \
-    addr = pc;                            \
+#define TAWNY_NEXT_OPCODE_FETCH(NEXT_TST)                                     \
+    addr = pc;                                                                \
     TAWNY_STEP_TAIL(access_cost_opcode(addr), (NEXT_TST))
 
 // FETCH_OPCODE_CASE — the last step of every instruction. Reads the next
@@ -373,39 +373,37 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 // step-0 tstate for the new instruction, sets up the operand-fetch address,
 // and breaks out so the while loop re-enters the switch at the new tstate.
 
-#define TAWNY_FETCH_OPCODE_CASE(OPCODE, STEP)                           \
-    case ((OPCODE) << 3) | (STEP): {                                    \
-        pc = static_cast<std::uint16_t>(pc + 1);                        \
-        tst  = static_cast<std::uint16_t>(                              \
-                   static_cast<std::uint16_t>(config.read_opcode(addr)) \
-                   << 3);                                               \
-        addr = pc;                                                      \
-        TAWNY_STEP_TAIL(access_cost(addr), tst);                        \
-        break;                                                          \
+#define TAWNY_FETCH_OPCODE_CASE(OPCODE, STEP)                                 \
+    case ((OPCODE) << 3) | (STEP): {                                          \
+        ++pc;                                                                 \
+        tst  = static_cast<std::uint16_t>(config.read_opcode(addr) << 3);     \
+        addr = pc;                                                            \
+        TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
+        break;                                                                \
     }
 
 // IMPLIED(OPCODE, OP_CLASS) — 2 cycles. Step 0 is a discarded operand-fetch
 // read; pc is NOT incremented (implied ops consume no bytes after the opcode).
 
-#define TAWNY_IMPLIED(OPCODE, OP_CLASS)               \
-    case ((OPCODE) << 3) | 0: {                       \
-        (void)config.read(addr);                      \
-        OP_CLASS::apply(r);                           \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1); \
-    }                                                 \
-    [[fallthrough]];                                  \
+#define TAWNY_IMPLIED(OPCODE, OP_CLASS)                                       \
+    case ((OPCODE) << 3) | 0: {                                               \
+        (void)config.read(addr);                                              \
+        OP_CLASS::apply(r);                                                   \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 1)
 
 // IMM_READ(OPCODE, OP_CLASS) — 2 cycles. Step 0 reads the immediate byte and
 // applies the op; pc advances past it.
 
-#define TAWNY_IMM_READ(OPCODE, OP_CLASS)              \
-    case ((OPCODE) << 3) | 0: {                       \
-        pc = static_cast<std::uint16_t>(pc + 1);      \
-        OP_CLASS::apply(r, config.read(addr));        \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1); \
-    }                                                 \
-    [[fallthrough]];                                  \
+#define TAWNY_IMM_READ(OPCODE, OP_CLASS)                                      \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        OP_CLASS::apply(r, config.read(addr));                                \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 1)
 
 // ZP_READ(OPCODE, OP_CLASS) — 3 cycles.
@@ -413,20 +411,20 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 //   step 1: read value from ZP, apply op.
 //   step 2: opcode fetch for next instruction.
 
-#define TAWNY_ZP_READ(OPCODE, OP_CLASS)                                  \
-    case ((OPCODE) << 3) | 0: {                                          \
-        pc = static_cast<std::uint16_t>(pc + 1);                         \
-        addr = config.read(addr);                                        \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 1);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 1: {                                          \
-        OP_CLASS::apply(r,                                               \
-            config.read_zp(static_cast<std::uint8_t>(addr)));            \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                    \
-    }                                                                    \
-    [[fallthrough]];                                                     \
+#define TAWNY_ZP_READ(OPCODE, OP_CLASS)                                       \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        addr = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 1);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        OP_CLASS::apply(r,                                                    \
+            config.read_zp(static_cast<std::uint8_t>(addr)));                 \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 2)
 
 // ZP_WRITE(OPCODE, OP_CLASS) — 3 cycles.
@@ -434,20 +432,20 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 //   step 1: write op_class::value(cpu) to ZP.
 //   step 2: opcode fetch for next instruction.
 
-#define TAWNY_ZP_WRITE(OPCODE, OP_CLASS)                                 \
-    case ((OPCODE) << 3) | 0: {                                          \
-        pc = static_cast<std::uint16_t>(pc + 1);                         \
-        addr = config.read(addr);                                        \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 1);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 1: {                                          \
-        config.write_zp(static_cast<std::uint8_t>(addr),                 \
-                        OP_CLASS::value(r));                             \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                    \
-    }                                                                    \
-    [[fallthrough]];                                                     \
+#define TAWNY_ZP_WRITE(OPCODE, OP_CLASS)                                      \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        addr = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 1);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        config.write_zp(static_cast<std::uint8_t>(addr),                      \
+                        OP_CLASS::value(r));                                  \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 2)
 
 // ABS_READ(OPCODE, OP_CLASS) — 4 cycles.
@@ -456,27 +454,27 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 //   step 2: read target value, apply op.
 //   step 3: opcode fetch for next instruction.
 
-#define TAWNY_ABS_READ(OPCODE, OP_CLASS)                           \
-    case ((OPCODE) << 3) | 0: {                                    \
-        pc = static_cast<std::uint16_t>(pc + 1);                   \
-        base = config.read(addr);                                  \
-        addr = pc;                                                 \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);   \
-    }                                                              \
-    [[fallthrough]];                                               \
-    case ((OPCODE) << 3) | 1: {                                    \
-        pc = static_cast<std::uint16_t>(pc + 1);                   \
-        addr = static_cast<std::uint16_t>(                         \
-            (base & 0x00FFu) |                                     \
-            (static_cast<std::uint16_t>(config.read(addr)) << 8)); \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);   \
-    }                                                              \
-    [[fallthrough]];                                               \
-    case ((OPCODE) << 3) | 2: {                                    \
-        OP_CLASS::apply(r, config.read(addr));                     \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);              \
-    }                                                              \
-    [[fallthrough]];                                               \
+#define TAWNY_ABS_READ(OPCODE, OP_CLASS)                                      \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        base = config.read(addr);                                             \
+        addr = pc;                                                            \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        ++pc;                                                                 \
+        addr = static_cast<std::uint16_t>(                                    \
+            (base & 0x00FFu) |                                                \
+            (config.read(addr) << 8));                                        \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        OP_CLASS::apply(r, config.read(addr));                                \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
 
 // ABS_JUMP(OPCODE) — JMP abs, 3 cycles. No op class; updates pc in place.
@@ -484,96 +482,96 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 //   step 1: read addr hi, set pc = (hi << 8) | (base & 0xFF).
 //   step 2: opcode fetch at new pc.
 
-#define TAWNY_ABS_JUMP(OPCODE)                                     \
-    case ((OPCODE) << 3) | 0: {                                    \
-        pc = static_cast<std::uint16_t>(pc + 1);                   \
-        base = config.read(addr);                                  \
-        addr = pc;                                                 \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);   \
-    }                                                              \
-    [[fallthrough]];                                               \
-    case ((OPCODE) << 3) | 1: {                                    \
-        pc = static_cast<std::uint16_t>(                           \
-            (base & 0x00FFu) |                                     \
-            (static_cast<std::uint16_t>(config.read(addr)) << 8)); \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);              \
-    }                                                              \
-    [[fallthrough]];                                               \
+#define TAWNY_ABS_JUMP(OPCODE)                                                \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        base = config.read(addr);                                             \
+        addr = pc;                                                            \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        pc = static_cast<std::uint16_t>(                                      \
+            (base & 0x00FFu) |                                                \
+            (config.read(addr) << 8));                                        \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 2)
 
 // ABS_WRITE(OPCODE, OP_CLASS) — 4 cycles. Like ABS_READ but the final step
 // writes OP_CLASS::value(cpu) instead of reading.
-#define TAWNY_ABS_WRITE(OPCODE, OP_CLASS)                          \
-    case ((OPCODE) << 3) | 0: {                                    \
-        pc = static_cast<std::uint16_t>(pc + 1);                   \
-        base = config.read(addr);                                  \
-        addr = pc;                                                 \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);   \
-    }                                                              \
-    [[fallthrough]];                                               \
-    case ((OPCODE) << 3) | 1: {                                    \
-        pc = static_cast<std::uint16_t>(pc + 1);                   \
-        addr = static_cast<std::uint16_t>(                         \
-            (base & 0x00FFu) |                                     \
-            (static_cast<std::uint16_t>(config.read(addr)) << 8)); \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);   \
-    }                                                              \
-    [[fallthrough]];                                               \
-    case ((OPCODE) << 3) | 2: {                                    \
-        config.write(addr, OP_CLASS::value(r));                    \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);              \
-    }                                                              \
-    [[fallthrough]];                                               \
+#define TAWNY_ABS_WRITE(OPCODE, OP_CLASS)                                     \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        base = config.read(addr);                                             \
+        addr = pc;                                                            \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        ++pc;                                                                 \
+        addr = static_cast<std::uint16_t>(                                    \
+            (base & 0x00FFu) |                                                \
+            (config.read(addr) << 8));                                        \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        config.write(addr, OP_CLASS::value(r));                               \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
 
 // ZP_INDEXED_READ / ZP_INDEXED_WRITE — 4 cycles. Parameterised by index reg
 // (X or Y). The indexed-zp address wraps within ZP ((base + idx) & 0xFF).
-#define TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, IDX)                     \
-    case ((OPCODE) << 3) | 0: {                                          \
-        pc = static_cast<std::uint16_t>(pc + 1);                         \
-        addr = config.read(addr);                                        \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 1);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 1: {                                          \
-        (void)config.read_zp(static_cast<std::uint8_t>(addr));           \
-        addr = static_cast<std::uint16_t>(                               \
-            static_cast<std::uint8_t>(addr + (IDX)));                    \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 2);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 2: {                                          \
-        OP_CLASS::apply(r,                                               \
-            config.read_zp(static_cast<std::uint8_t>(addr)));            \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                    \
-    }                                                                    \
-    [[fallthrough]];                                                     \
+#define TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, IDX)                          \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        addr = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 1);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        (void)config.read_zp(static_cast<std::uint8_t>(addr));                \
+        addr = static_cast<std::uint16_t>(                                    \
+            static_cast<std::uint8_t>(addr + (IDX)));                         \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 2);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        OP_CLASS::apply(r,                                                    \
+            config.read_zp(static_cast<std::uint8_t>(addr)));                 \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
 
-#define TAWNY_ZP_INDEXED_WRITE(OPCODE, OP_CLASS, IDX)                    \
-    case ((OPCODE) << 3) | 0: {                                          \
-        pc = static_cast<std::uint16_t>(pc + 1);                         \
-        addr = config.read(addr);                                        \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 1);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 1: {                                          \
-        (void)config.read_zp(static_cast<std::uint8_t>(addr));           \
-        addr = static_cast<std::uint16_t>(                               \
-            static_cast<std::uint8_t>(addr + (IDX)));                    \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 2);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 2: {                                          \
-        config.write_zp(static_cast<std::uint8_t>(addr),                 \
-                        OP_CLASS::value(r));                             \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                    \
-    }                                                                    \
-    [[fallthrough]];                                                     \
+#define TAWNY_ZP_INDEXED_WRITE(OPCODE, OP_CLASS, IDX)                         \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        addr = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 1);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        (void)config.read_zp(static_cast<std::uint8_t>(addr));                \
+        addr = static_cast<std::uint16_t>(                                    \
+            static_cast<std::uint8_t>(addr + (IDX)));                         \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 2);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        config.write_zp(static_cast<std::uint8_t>(addr),                      \
+                        OP_CLASS::value(r));                                  \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
 
 #define TAWNY_ZPX_READ(OPCODE, OP_CLASS)  TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, r.x)
@@ -586,83 +584,83 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 // correct, and we skip the fix-up cycle. If it did carry, step 2 does a
 // dummy read at the wrong page, fixes the high byte, and step 3 does the
 // real read.
-#define TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, IDX)                        \
-    case ((OPCODE) << 3) | 0: {                                             \
-        pc = static_cast<std::uint16_t>(pc + 1);                            \
-        base = config.read(addr);                                           \
-        addr = pc;                                                          \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);            \
-    }                                                                       \
-    [[fallthrough]];                                                        \
-    case ((OPCODE) << 3) | 1: {                                             \
-        pc = static_cast<std::uint16_t>(pc + 1);                            \
-        /* Compute target addr + page-cross flag in a tight sub-scope so    \
-           _hi/_lo_sum aren't live at the step-2 case label below (case     \
-           labels can't bypass initializations in enclosing scope). */      \
-        bool _cross;                                                        \
-        {                                                                   \
-            auto _hi     = config.read(addr);                               \
-            auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX)); \
-            addr = static_cast<std::uint16_t>(                              \
-                (_hi << 8) | (_lo_sum & 0x00FFu));                          \
-            _cross = _lo_sum > 0xFFu;                                       \
-        }                                                                   \
-        /* Common path: no page cross — fall straight through to step 3,    \
-           no break, no tst write, no re-dispatch. On page cross we enter   \
-           the if body and the nested step-2 case label, then also fall     \
-           through to step 3. */                                            \
-        if (_cross) {                                                       \
-            base = static_cast<std::uint16_t>(addr + 0x0100u);              \
-            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);        \
-    case ((OPCODE) << 3) | 2:                                               \
-            (void)config.read(addr);                                        \
-            addr = base;                                                    \
-            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);        \
-        } else {                                                            \
-            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);        \
-        }                                                                   \
-    }                                                                       \
-    [[fallthrough]];                                                        \
-    case ((OPCODE) << 3) | 3: {                                             \
-        OP_CLASS::apply(r, config.read(addr));                              \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                       \
-    }                                                                       \
-    [[fallthrough]];                                                        \
+#define TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, IDX)                          \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        base = config.read(addr);                                             \
+        addr = pc;                                                            \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        ++pc;                                                                 \
+        /* Compute target addr + page-cross flag in a tight sub-scope so      \
+           _hi/_lo_sum aren't live at the step-2 case label below (case       \
+           labels can't bypass initializations in enclosing scope). */        \
+        bool _cross;                                                          \
+        {                                                                     \
+            auto _hi     = config.read(addr);                                 \
+            auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));   \
+            addr = static_cast<std::uint16_t>(                                \
+                (_hi << 8) | (_lo_sum & 0x00FFu));                            \
+            _cross = _lo_sum > 0xFFu;                                         \
+        }                                                                     \
+        /* Common path: no page cross — fall straight through to step 3,      \
+           no break, no tst write, no re-dispatch. On page cross we enter     \
+           the if body and the nested step-2 case label, then also fall       \
+           through to step 3. */                                              \
+        if (_cross) {                                                         \
+            base = static_cast<std::uint16_t>(addr + 0x0100u);                \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);          \
+    case ((OPCODE) << 3) | 2:                                                 \
+            (void)config.read(addr);                                          \
+            addr = base;                                                      \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);          \
+        } else {                                                              \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);          \
+        }                                                                     \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        OP_CLASS::apply(r, config.read(addr));                                \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 4)
 
 // ABS_INDEXED_WRITE — always 5 cycles (no skip — penalty always paid).
-#define TAWNY_AB_INDEXED_WRITE(OPCODE, OP_CLASS, IDX)                   \
-    case ((OPCODE) << 3) | 0: {                                         \
-        pc = static_cast<std::uint16_t>(pc + 1);                        \
-        base = config.read(addr);                                       \
-        addr = pc;                                                      \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 1: {                                         \
-        pc = static_cast<std::uint16_t>(pc + 1);                        \
-        auto _hi     = config.read(addr);                               \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX)); \
-        addr = static_cast<std::uint16_t>(                              \
-            (_hi << 8) | (_lo_sum & 0x00FFu));                          \
-        /* stash correct addr for step 3 */                             \
-        base = static_cast<std::uint16_t>(                              \
-            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                        \
-            (_lo_sum & 0x00FFu));                                       \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 2: {                                         \
-        (void)config.read(addr);                                        \
-        addr = base;                                                    \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 3: {                                         \
-        config.write(addr, OP_CLASS::value(r));                         \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                   \
-    }                                                                   \
-    [[fallthrough]];                                                    \
+#define TAWNY_AB_INDEXED_WRITE(OPCODE, OP_CLASS, IDX)                         \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        base = config.read(addr);                                             \
+        addr = pc;                                                            \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        ++pc;                                                                 \
+        auto _hi     = config.read(addr);                                     \
+        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));       \
+        addr = static_cast<std::uint16_t>(                                    \
+            (_hi << 8) | (_lo_sum & 0x00FFu));                                \
+        /* stash correct addr for step 3 */                                   \
+        base = static_cast<std::uint16_t>(                                    \
+            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                              \
+            (_lo_sum & 0x00FFu));                                             \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        (void)config.read(addr);                                              \
+        addr = base;                                                          \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        config.write(addr, OP_CLASS::value(r));                               \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 4)
 
 #define TAWNY_ABX_READ(OPCODE, OP_CLASS)  TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, r.x)
@@ -672,627 +670,627 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 
 // IZX (indirect,X) read/write — 6 cycles. ZP index with X, then fetch 2-byte
 // pointer from ZP (wrapping in ZP), then read/write from target.
-#define TAWNY_IZX_READ(OPCODE, OP_CLASS)                                 \
-    case ((OPCODE) << 3) | 0: {                                          \
-        pc = static_cast<std::uint16_t>(pc + 1);                         \
-        auto _zp = config.read(addr);                                    \
-        base = static_cast<std::uint16_t>(                               \
-            static_cast<std::uint8_t>(_zp + r.x));                       \
-        addr = static_cast<std::uint16_t>(_zp);                          \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 1);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 1: {                                          \
-        (void)config.read_zp(static_cast<std::uint8_t>(addr));           \
-        addr = base;                                                     \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 2);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 2: {                                          \
-        base = config.read_zp(static_cast<std::uint8_t>(addr));          \
-        addr = static_cast<std::uint16_t>(                               \
-            static_cast<std::uint8_t>(addr + 1));                        \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 3);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 3: {                                          \
-        addr = static_cast<std::uint16_t>(                               \
-            (base & 0x00FFu) |                                           \
-            (static_cast<std::uint16_t>(                                 \
-                config.read_zp(static_cast<std::uint8_t>(addr))) << 8)); \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);         \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 4: {                                          \
-        OP_CLASS::apply(r, config.read(addr));                           \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                    \
-    }                                                                    \
-    [[fallthrough]];                                                     \
+#define TAWNY_IZX_READ(OPCODE, OP_CLASS)                                      \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        auto _zp = config.read(addr);                                         \
+        base = static_cast<std::uint16_t>(                                    \
+            static_cast<std::uint8_t>(_zp + r.x));                            \
+        addr = static_cast<std::uint16_t>(_zp);                               \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 1);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        (void)config.read_zp(static_cast<std::uint8_t>(addr));                \
+        addr = base;                                                          \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 2);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        base = config.read_zp(static_cast<std::uint8_t>(addr));               \
+        addr = static_cast<std::uint16_t>(                                    \
+            static_cast<std::uint8_t>(addr + 1));                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 3);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        addr = static_cast<std::uint16_t>(                                    \
+            (base & 0x00FFu) |                                                \
+            (static_cast<std::uint16_t>(                                      \
+                config.read_zp(static_cast<std::uint8_t>(addr))) << 8));      \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        OP_CLASS::apply(r, config.read(addr));                                \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
 
-#define TAWNY_IZX_WRITE(OPCODE, OP_CLASS)                                \
-    case ((OPCODE) << 3) | 0: {                                          \
-        pc = static_cast<std::uint16_t>(pc + 1);                         \
-        auto _zp = config.read(addr);                                    \
-        base = static_cast<std::uint16_t>(                               \
-            static_cast<std::uint8_t>(_zp + r.x));                       \
-        addr = static_cast<std::uint16_t>(_zp);                          \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 1);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 1: {                                          \
-        (void)config.read_zp(static_cast<std::uint8_t>(addr));           \
-        addr = base;                                                     \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 2);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 2: {                                          \
-        base = config.read_zp(static_cast<std::uint8_t>(addr));          \
-        addr = static_cast<std::uint16_t>(                               \
-            static_cast<std::uint8_t>(addr + 1));                        \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 3);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 3: {                                          \
-        addr = static_cast<std::uint16_t>(                               \
-            (base & 0x00FFu) |                                           \
-            (static_cast<std::uint16_t>(                                 \
-                config.read_zp(static_cast<std::uint8_t>(addr))) << 8)); \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);         \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 4: {                                          \
-        config.write(addr, OP_CLASS::value(r));                          \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                    \
-    }                                                                    \
-    [[fallthrough]];                                                     \
+#define TAWNY_IZX_WRITE(OPCODE, OP_CLASS)                                     \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        auto _zp = config.read(addr);                                         \
+        base = static_cast<std::uint16_t>(                                    \
+            static_cast<std::uint8_t>(_zp + r.x));                            \
+        addr = static_cast<std::uint16_t>(_zp);                               \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 1);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        (void)config.read_zp(static_cast<std::uint8_t>(addr));                \
+        addr = base;                                                          \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 2);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        base = config.read_zp(static_cast<std::uint8_t>(addr));               \
+        addr = static_cast<std::uint16_t>(                                    \
+            static_cast<std::uint8_t>(addr + 1));                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 3);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        addr = static_cast<std::uint16_t>(                                    \
+            (base & 0x00FFu) |                                                \
+            (static_cast<std::uint16_t>(                                      \
+                config.read_zp(static_cast<std::uint8_t>(addr))) << 8));      \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        config.write(addr, OP_CLASS::value(r));                               \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
 
 // IZY (indirect),Y read/write — 5 or 6 cycles for reads (page-cross
 // penalty); always 6 for writes.
-#define TAWNY_IZY_READ(OPCODE, OP_CLASS)                                    \
-    case ((OPCODE) << 3) | 0: {                                             \
-        pc = static_cast<std::uint16_t>(pc + 1);                            \
-        addr = static_cast<std::uint16_t>(config.read(addr));               \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),    \
-                        ((OPCODE) << 3) | 1);                               \
-    }                                                                       \
-    [[fallthrough]];                                                        \
-    case ((OPCODE) << 3) | 1: {                                             \
-        base = config.read_zp(static_cast<std::uint8_t>(addr));             \
-        addr = static_cast<std::uint16_t>(                                  \
-            static_cast<std::uint8_t>(addr + 1));                           \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),    \
-                        ((OPCODE) << 3) | 2);                               \
-    }                                                                       \
-    [[fallthrough]];                                                        \
-    case ((OPCODE) << 3) | 2: {                                             \
-        /* Same trick as AB_INDEXED_READ: nested step-3 case label inside   \
-           the page-cross branch, fall straight through to step 4 on the    \
-           common (no-cross) path. _hi/_lo_sum scoped tightly so the case   \
-           label doesn't bypass their initializations. */                   \
-        bool _cross;                                                        \
-        {                                                                   \
-            auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr)); \
-            auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);   \
-            addr = static_cast<std::uint16_t>(                              \
-                (_hi << 8) | (_lo_sum & 0x00FFu));                          \
-            _cross = _lo_sum > 0xFFu;                                       \
-        }                                                                   \
-        if (_cross) {                                                       \
-            base = static_cast<std::uint16_t>(addr + 0x0100u);              \
-            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);        \
-    case ((OPCODE) << 3) | 3:                                               \
-            (void)config.read(addr);                                        \
-            addr = base;                                                    \
-            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);        \
-        } else {                                                            \
-            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);        \
-        }                                                                   \
-    }                                                                       \
-    [[fallthrough]];                                                        \
-    case ((OPCODE) << 3) | 4: {                                             \
-        OP_CLASS::apply(r, config.read(addr));                              \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                       \
-    }                                                                       \
-    [[fallthrough]];                                                        \
+#define TAWNY_IZY_READ(OPCODE, OP_CLASS)                                      \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        addr = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 1);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        base = config.read_zp(static_cast<std::uint8_t>(addr));               \
+        addr = static_cast<std::uint16_t>(                                    \
+            static_cast<std::uint8_t>(addr + 1));                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 2);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        /* Same trick as AB_INDEXED_READ: nested step-3 case label inside     \
+           the page-cross branch, fall straight through to step 4 on the      \
+           common (no-cross) path. _hi/_lo_sum scoped tightly so the case     \
+           label doesn't bypass their initializations. */                     \
+        bool _cross;                                                          \
+        {                                                                     \
+            auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));   \
+            auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);     \
+            addr = static_cast<std::uint16_t>(                                \
+                (_hi << 8) | (_lo_sum & 0x00FFu));                            \
+            _cross = _lo_sum > 0xFFu;                                         \
+        }                                                                     \
+        if (_cross) {                                                         \
+            base = static_cast<std::uint16_t>(addr + 0x0100u);                \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);          \
+    case ((OPCODE) << 3) | 3:                                                 \
+            (void)config.read(addr);                                          \
+            addr = base;                                                      \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);          \
+        } else {                                                              \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);          \
+        }                                                                     \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        OP_CLASS::apply(r, config.read(addr));                                \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
 
-#define TAWNY_IZY_WRITE(OPCODE, OP_CLASS)                                \
-    case ((OPCODE) << 3) | 0: {                                          \
-        pc = static_cast<std::uint16_t>(pc + 1);                         \
-        addr = static_cast<std::uint16_t>(config.read(addr));            \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 1);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 1: {                                          \
-        base = config.read_zp(static_cast<std::uint8_t>(addr));          \
-        addr = static_cast<std::uint16_t>(                               \
-            static_cast<std::uint8_t>(addr + 1));                        \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 2);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 2: {                                          \
-        auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));  \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);    \
-        addr = static_cast<std::uint16_t>(                               \
-            (_hi << 8) | (_lo_sum & 0x00FFu));                           \
-        base = static_cast<std::uint16_t>(                               \
-            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                         \
-            (_lo_sum & 0x00FFu));                                        \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);         \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 3: {                                          \
-        (void)config.read(addr);                                         \
-        addr = base;                                                     \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);         \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 4: {                                          \
-        config.write(addr, OP_CLASS::value(r));                          \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                    \
-    }                                                                    \
-    [[fallthrough]];                                                     \
+#define TAWNY_IZY_WRITE(OPCODE, OP_CLASS)                                     \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        addr = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 1);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        base = config.read_zp(static_cast<std::uint8_t>(addr));               \
+        addr = static_cast<std::uint16_t>(                                    \
+            static_cast<std::uint8_t>(addr + 1));                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 2);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));       \
+        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);         \
+        addr = static_cast<std::uint16_t>(                                    \
+            (_hi << 8) | (_lo_sum & 0x00FFu));                                \
+        base = static_cast<std::uint16_t>(                                    \
+            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                              \
+            (_lo_sum & 0x00FFu));                                             \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        (void)config.read(addr);                                              \
+        addr = base;                                                          \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        config.write(addr, OP_CLASS::value(r));                               \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
 
 // ACC_RMW(OPCODE, OP_CLASS) — ASL A / LSR A / ROL A / ROR A. 2 cycles:
 // dummy operand read, apply op to A, fetch_opcode.
-#define TAWNY_ACC_RMW(OPCODE, OP_CLASS)               \
-    case ((OPCODE) << 3) | 0: {                       \
-        (void)config.read(addr);                      \
-        r.a = OP_CLASS::apply(r, r.a);                \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1); \
-    }                                                 \
-    [[fallthrough]];                                  \
+#define TAWNY_ACC_RMW(OPCODE, OP_CLASS)                                       \
+    case ((OPCODE) << 3) | 0: {                                               \
+        (void)config.read(addr);                                              \
+        r.a = OP_CLASS::apply(r, r.a);                                        \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 1)
 
 // RMW addressing modes. Each does a read-modify-write: read original value,
 // dummy-write it back, then write the transformed value. 6502 quirk.
 //
 // ZP_RMW: 5 cycles. ZPX_RMW: 6. ABS_RMW: 6. ABX_RMW: 7 (always).
-#define TAWNY_ZP_RMW(OPCODE, OP_CLASS)                                   \
-    case ((OPCODE) << 3) | 0: {                                          \
-        pc = static_cast<std::uint16_t>(pc + 1);                         \
-        addr = config.read(addr);                                        \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 1);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 1: {                                          \
-        base = config.read_zp(static_cast<std::uint8_t>(addr));          \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 2);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 2: {                                          \
-        config.write_zp(static_cast<std::uint8_t>(addr),                 \
-                        static_cast<std::uint8_t>(base));                \
-        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));      \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 3);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 3: {                                          \
-        config.write_zp(static_cast<std::uint8_t>(addr),                 \
-                        static_cast<std::uint8_t>(base));                \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                    \
-    }                                                                    \
-    [[fallthrough]];                                                     \
+#define TAWNY_ZP_RMW(OPCODE, OP_CLASS)                                        \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        addr = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 1);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        base = config.read_zp(static_cast<std::uint8_t>(addr));               \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 2);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        config.write_zp(static_cast<std::uint8_t>(addr),                      \
+                        static_cast<std::uint8_t>(base));                     \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));           \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 3);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        config.write_zp(static_cast<std::uint8_t>(addr),                      \
+                        static_cast<std::uint8_t>(base));                     \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 4)
 
-#define TAWNY_ZPX_RMW(OPCODE, OP_CLASS)                                  \
-    case ((OPCODE) << 3) | 0: {                                          \
-        pc = static_cast<std::uint16_t>(pc + 1);                         \
-        addr = config.read(addr);                                        \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 1);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 1: {                                          \
-        (void)config.read_zp(static_cast<std::uint8_t>(addr));           \
-        addr = static_cast<std::uint16_t>(                               \
-            static_cast<std::uint8_t>(addr + r.x));                      \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 2);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 2: {                                          \
-        base = config.read_zp(static_cast<std::uint8_t>(addr));          \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 3);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 3: {                                          \
-        config.write_zp(static_cast<std::uint8_t>(addr),                 \
-                        static_cast<std::uint8_t>(base));                \
-        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));      \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)), \
-                        ((OPCODE) << 3) | 4);                            \
-    }                                                                    \
-    [[fallthrough]];                                                     \
-    case ((OPCODE) << 3) | 4: {                                          \
-        config.write_zp(static_cast<std::uint8_t>(addr),                 \
-                        static_cast<std::uint8_t>(base));                \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                    \
-    }                                                                    \
-    [[fallthrough]];                                                     \
+#define TAWNY_ZPX_RMW(OPCODE, OP_CLASS)                                       \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        addr = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 1);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        (void)config.read_zp(static_cast<std::uint8_t>(addr));                \
+        addr = static_cast<std::uint16_t>(                                    \
+            static_cast<std::uint8_t>(addr + r.x));                           \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 2);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        base = config.read_zp(static_cast<std::uint8_t>(addr));               \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 3);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        config.write_zp(static_cast<std::uint8_t>(addr),                      \
+                        static_cast<std::uint8_t>(base));                     \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));           \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 4);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        config.write_zp(static_cast<std::uint8_t>(addr),                      \
+                        static_cast<std::uint8_t>(base));                     \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
 
-#define TAWNY_ABS_RMW(OPCODE, OP_CLASS)                             \
-    case ((OPCODE) << 3) | 0: {                                     \
-        pc = static_cast<std::uint16_t>(pc + 1);                    \
-        base = config.read(addr);                                   \
-        addr = pc;                                                  \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);    \
-    }                                                               \
-    [[fallthrough]];                                                \
-    case ((OPCODE) << 3) | 1: {                                     \
-        pc = static_cast<std::uint16_t>(pc + 1);                    \
-        addr = static_cast<std::uint16_t>(                          \
-            (base & 0x00FFu) |                                      \
-            (static_cast<std::uint16_t>(config.read(addr)) << 8));  \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);    \
-    }                                                               \
-    [[fallthrough]];                                                \
-    case ((OPCODE) << 3) | 2: {                                     \
-        base = config.read(addr);                                   \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);    \
-    }                                                               \
-    [[fallthrough]];                                                \
-    case ((OPCODE) << 3) | 3: {                                     \
-        config.write(addr, static_cast<std::uint8_t>(base));        \
-        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base)); \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);    \
-    }                                                               \
-    [[fallthrough]];                                                \
-    case ((OPCODE) << 3) | 4: {                                     \
-        config.write(addr, static_cast<std::uint8_t>(base));        \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);               \
-    }                                                               \
-    [[fallthrough]];                                                \
+#define TAWNY_ABS_RMW(OPCODE, OP_CLASS)                                       \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        base = config.read(addr);                                             \
+        addr = pc;                                                            \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        ++pc;                                                                 \
+        addr = static_cast<std::uint16_t>(                                    \
+            (base & 0x00FFu) |                                                \
+            (config.read(addr) << 8));                                        \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        base = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        config.write(addr, static_cast<std::uint8_t>(base));                  \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));           \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        config.write(addr, static_cast<std::uint8_t>(base));                  \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
 
-#define TAWNY_AB_INDEXED_RMW(OPCODE, OP_CLASS, IDX)                     \
-    case ((OPCODE) << 3) | 0: {                                         \
-        pc = static_cast<std::uint16_t>(pc + 1);                        \
-        base = config.read(addr);                                       \
-        addr = pc;                                                      \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 1: {                                         \
-        pc = static_cast<std::uint16_t>(pc + 1);                        \
-        auto _hi     = config.read(addr);                               \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX)); \
-        addr = static_cast<std::uint16_t>(                              \
-            (_hi << 8) | (_lo_sum & 0x00FFu));                          \
-        base = static_cast<std::uint16_t>(                              \
-            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                        \
-            (_lo_sum & 0x00FFu));                                       \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 2: {                                         \
-        (void)config.read(addr);                                        \
-        addr = base;                                                    \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 3: {                                         \
-        base = config.read(addr);                                       \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 4: {                                         \
-        config.write(addr, static_cast<std::uint8_t>(base));            \
-        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));     \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 5: {                                         \
-        config.write(addr, static_cast<std::uint8_t>(base));            \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 6);                   \
-    }                                                                   \
-    [[fallthrough]];                                                    \
+#define TAWNY_AB_INDEXED_RMW(OPCODE, OP_CLASS, IDX)                           \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        base = config.read(addr);                                             \
+        addr = pc;                                                            \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        ++pc;                                                                 \
+        auto _hi     = config.read(addr);                                     \
+        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));       \
+        addr = static_cast<std::uint16_t>(                                    \
+            (_hi << 8) | (_lo_sum & 0x00FFu));                                \
+        base = static_cast<std::uint16_t>(                                    \
+            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                              \
+            (_lo_sum & 0x00FFu));                                             \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        (void)config.read(addr);                                              \
+        addr = base;                                                          \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        base = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        config.write(addr, static_cast<std::uint8_t>(base));                  \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));           \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 5: {                                               \
+        config.write(addr, static_cast<std::uint8_t>(base));                  \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 6);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 6)
 
 #define TAWNY_ABX_RMW(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_RMW(OPCODE, OP_CLASS, r.x)
 #define TAWNY_ABY_RMW(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_RMW(OPCODE, OP_CLASS, r.y)
 
 // IZX_RMW — 8 cycles. Indexed-indirect (zp,X) RMW.
-#define TAWNY_IZX_RMW(OPCODE, OP_CLASS)                                 \
-    case ((OPCODE) << 3) | 0: {                                         \
-        pc = static_cast<std::uint16_t>(pc + 1);                        \
-        auto _zp = config.read(addr);                                   \
-        base = static_cast<std::uint16_t>(                              \
-            static_cast<std::uint8_t>(_zp + r.x));                      \
-        addr = static_cast<std::uint16_t>(_zp);                         \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),\
-                        ((OPCODE) << 3) | 1);                           \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 1: {                                         \
-        (void)config.read_zp(static_cast<std::uint8_t>(addr));          \
-        addr = base;                                                    \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),\
-                        ((OPCODE) << 3) | 2);                           \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 2: {                                         \
-        base = config.read_zp(static_cast<std::uint8_t>(addr));         \
-        addr = static_cast<std::uint16_t>(                              \
-            static_cast<std::uint8_t>(addr + 1));                       \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),\
-                        ((OPCODE) << 3) | 3);                           \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 3: {                                         \
-        addr = static_cast<std::uint16_t>(                              \
-            (base & 0x00FFu) |                                          \
-            (static_cast<std::uint16_t>(                                \
-                config.read_zp(static_cast<std::uint8_t>(addr))) << 8));\
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 4: {                                         \
-        base = config.read(addr);                                       \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 5: {                                         \
-        config.write(addr, static_cast<std::uint8_t>(base));            \
-        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));     \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 6);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 6: {                                         \
-        config.write(addr, static_cast<std::uint8_t>(base));            \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 7);                   \
-    }                                                                   \
-    [[fallthrough]];                                                    \
+#define TAWNY_IZX_RMW(OPCODE, OP_CLASS)                                       \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        auto _zp = config.read(addr);                                         \
+        base = static_cast<std::uint16_t>(                                    \
+            static_cast<std::uint8_t>(_zp + r.x));                            \
+        addr = static_cast<std::uint16_t>(_zp);                               \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 1);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        (void)config.read_zp(static_cast<std::uint8_t>(addr));                \
+        addr = base;                                                          \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 2);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        base = config.read_zp(static_cast<std::uint8_t>(addr));               \
+        addr = static_cast<std::uint16_t>(                                    \
+            static_cast<std::uint8_t>(addr + 1));                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 3);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        addr = static_cast<std::uint16_t>(                                    \
+            (base & 0x00FFu) |                                                \
+            (static_cast<std::uint16_t>(                                      \
+                config.read_zp(static_cast<std::uint8_t>(addr))) << 8));      \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        base = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 5: {                                               \
+        config.write(addr, static_cast<std::uint8_t>(base));                  \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));           \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 6);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 6: {                                               \
+        config.write(addr, static_cast<std::uint8_t>(base));                  \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 7);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 7)
 
 // IZY_RMW — 8 cycles. Always pays the page-cross fix-up (like IZY_WRITE).
-#define TAWNY_IZY_RMW(OPCODE, OP_CLASS)                                 \
-    case ((OPCODE) << 3) | 0: {                                         \
-        pc = static_cast<std::uint16_t>(pc + 1);                        \
-        addr = static_cast<std::uint16_t>(config.read(addr));           \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),\
-                        ((OPCODE) << 3) | 1);                           \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 1: {                                         \
-        base = config.read_zp(static_cast<std::uint8_t>(addr));         \
-        addr = static_cast<std::uint16_t>(                              \
-            static_cast<std::uint8_t>(addr + 1));                       \
-        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),\
-                        ((OPCODE) << 3) | 2);                           \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 2: {                                         \
-        auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr)); \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);   \
-        addr = static_cast<std::uint16_t>(                              \
-            (_hi << 8) | (_lo_sum & 0x00FFu));                          \
-        base = static_cast<std::uint16_t>(                              \
-            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                        \
-            (_lo_sum & 0x00FFu));                                       \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 3: {                                         \
-        (void)config.read(addr);                                        \
-        addr = base;                                                    \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 4: {                                         \
-        base = config.read(addr);                                       \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 5: {                                         \
-        config.write(addr, static_cast<std::uint8_t>(base));            \
-        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));     \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 6);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 6: {                                         \
-        config.write(addr, static_cast<std::uint8_t>(base));            \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 7);                   \
-    }                                                                   \
-    [[fallthrough]];                                                    \
+#define TAWNY_IZY_RMW(OPCODE, OP_CLASS)                                       \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        addr = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 1);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        base = config.read_zp(static_cast<std::uint8_t>(addr));               \
+        addr = static_cast<std::uint16_t>(                                    \
+            static_cast<std::uint8_t>(addr + 1));                             \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
+                        ((OPCODE) << 3) | 2);                                 \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));       \
+        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);         \
+        addr = static_cast<std::uint16_t>(                                    \
+            (_hi << 8) | (_lo_sum & 0x00FFu));                                \
+        base = static_cast<std::uint16_t>(                                    \
+            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                              \
+            (_lo_sum & 0x00FFu));                                             \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        (void)config.read(addr);                                              \
+        addr = base;                                                          \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        base = config.read(addr);                                             \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 5: {                                               \
+        config.write(addr, static_cast<std::uint8_t>(base));                  \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));           \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 6);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 6: {                                               \
+        config.write(addr, static_cast<std::uint8_t>(base));                  \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 7);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 7)
 
 // JMP (indirect) — 5 cycles. The NMOS 6502 has a well-known page-wrap bug:
 // when the pointer low byte is at $xxFF, the high byte is fetched from $xx00
 // (same page) rather than $(xx+1)00. We replicate.
-#define TAWNY_JMP_IND(OPCODE)                                      \
-    case ((OPCODE) << 3) | 0: {                                    \
-        pc = static_cast<std::uint16_t>(pc + 1);                   \
-        base = config.read(addr);                                  \
-        addr = pc;                                                 \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);   \
-    }                                                              \
-    [[fallthrough]];                                               \
-    case ((OPCODE) << 3) | 1: {                                    \
-        pc = static_cast<std::uint16_t>(pc + 1);                   \
-        addr = static_cast<std::uint16_t>(                         \
-            (base & 0x00FFu) |                                     \
-            (static_cast<std::uint16_t>(config.read(addr)) << 8)); \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);   \
-    }                                                              \
-    [[fallthrough]];                                               \
-    case ((OPCODE) << 3) | 2: {                                    \
-        base = config.read(addr);                                  \
-        /* NMOS bug: +1 wraps within the same page. */             \
-        addr = static_cast<std::uint16_t>(                         \
-            (addr & 0xFF00u) |                                     \
-            static_cast<std::uint8_t>((addr & 0xFFu) + 1));        \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);   \
-    }                                                              \
-    [[fallthrough]];                                               \
-    case ((OPCODE) << 3) | 3: {                                    \
-        pc = static_cast<std::uint16_t>(                           \
-            (base & 0x00FFu) |                                     \
-            (static_cast<std::uint16_t>(config.read(addr)) << 8)); \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);              \
-    }                                                              \
-    [[fallthrough]];                                               \
+#define TAWNY_JMP_IND(OPCODE)                                                 \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        base = config.read(addr);                                             \
+        addr = pc;                                                            \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        ++pc;                                                                 \
+        addr = static_cast<std::uint16_t>(                                    \
+            (base & 0x00FFu) |                                                \
+            (config.read(addr) << 8));                                        \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        base = config.read(addr);                                             \
+        /* NMOS bug: +1 wraps within the same page. */                        \
+        addr = static_cast<std::uint16_t>(                                    \
+            (addr & 0xFF00u) |                                                \
+            static_cast<std::uint8_t>((addr & 0xFFu) + 1));                   \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        pc = static_cast<std::uint16_t>(                                      \
+            (base & 0x00FFu) |                                                \
+            (config.read(addr) << 8));                                        \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 4)
 
 // JSR — 6 cycles. Reads addr lo, dummies a stack read, pushes PCH, pushes
 // PCL, reads addr hi (now forming the jump target), then fetch_opcode.
-#define TAWNY_JSR(OPCODE)                                            \
-    case ((OPCODE) << 3) | 0: {                                      \
-        pc = static_cast<std::uint16_t>(pc + 1);                     \
-        base = config.read(addr);                                    \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                       \
-    }                                                                \
-    [[fallthrough]];                                                 \
-    case ((OPCODE) << 3) | 1: {                                      \
-        (void)config.read_stack(r.s);                                \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                       \
-    }                                                                \
-    [[fallthrough]];                                                 \
-    case ((OPCODE) << 3) | 2: {                                      \
-        config.write_stack(r.s, static_cast<std::uint8_t>(pc >> 8)); \
-        r.s = static_cast<std::uint8_t>(r.s - 1);                    \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                       \
-    }                                                                \
-    [[fallthrough]];                                                 \
-    case ((OPCODE) << 3) | 3: {                                      \
-        config.write_stack(r.s, static_cast<std::uint8_t>(pc));      \
-        r.s = static_cast<std::uint8_t>(r.s - 1);                    \
-        addr = pc;                                                   \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);     \
-    }                                                                \
-    [[fallthrough]];                                                 \
-    case ((OPCODE) << 3) | 4: {                                      \
-        pc = static_cast<std::uint16_t>(                             \
-            (base & 0x00FFu) |                                       \
-            (static_cast<std::uint16_t>(config.read(addr)) << 8));   \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                \
-    }                                                                \
-    [[fallthrough]];                                                 \
+#define TAWNY_JSR(OPCODE)                                                     \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        base = config.read(addr);                                             \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        (void)config.read_stack(r.s);                                         \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        config.write_stack(r.s, static_cast<std::uint8_t>(pc >> 8));          \
+        --r.s;                                                                \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        config.write_stack(r.s, static_cast<std::uint8_t>(pc));               \
+        --r.s;                                                                \
+        addr = pc;                                                            \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        pc = static_cast<std::uint16_t>(                                      \
+            (base & 0x00FFu) |                                                \
+            (config.read(addr) << 8));                                        \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
 
 // RTS — 6 cycles. Dummy operand read, dummy stack read, pull PCL, pull PCH
 // (forming PC), dummy read at PC (pc++ afterwards), fetch_opcode.
-#define TAWNY_RTS(OPCODE)                                               \
-    case ((OPCODE) << 3) | 0: {                                         \
-        (void)config.read(addr);                                        \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                          \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 1: {                                         \
-        (void)config.read_stack(r.s);                                   \
-        r.s = static_cast<std::uint8_t>(r.s + 1);                       \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                          \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 2: {                                         \
-        base = config.read_stack(r.s);                                  \
-        r.s = static_cast<std::uint8_t>(r.s + 1);                       \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                          \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 3: {                                         \
-        pc = static_cast<std::uint16_t>(                                \
-            (base & 0x00FFu) |                                          \
-            (static_cast<std::uint16_t>(config.read_stack(r.s)) << 8)); \
-        addr = pc;                                                      \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);        \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 4: {                                         \
-        (void)config.read(addr);                                        \
-        pc = static_cast<std::uint16_t>(pc + 1);                        \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                   \
-    }                                                                   \
-    [[fallthrough]];                                                    \
+#define TAWNY_RTS(OPCODE)                                                     \
+    case ((OPCODE) << 3) | 0: {                                               \
+        (void)config.read(addr);                                              \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        (void)config.read_stack(r.s);                                         \
+        ++r.s;                                                                \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        base = config.read_stack(r.s);                                        \
+        ++r.s;                                                                \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        pc = static_cast<std::uint16_t>(                                      \
+            (base & 0x00FFu) |                                                \
+            (config.read_stack(r.s) << 8));                                   \
+        addr = pc;                                                            \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);              \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        (void)config.read(addr);                                              \
+        ++pc;                                                                 \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
 
 // RTI — 6 cycles. Dummy operand read, dummy stack read, pull P, pull PCL,
 // pull PCH (forming PC), fetch_opcode.
-#define TAWNY_RTI(OPCODE)                                               \
-    case ((OPCODE) << 3) | 0: {                                         \
-        (void)config.read(addr);                                        \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                          \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 1: {                                         \
-        (void)config.read_stack(r.s);                                   \
-        r.s = static_cast<std::uint8_t>(r.s + 1);                       \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                          \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 2: {                                         \
-        r.p = static_cast<std::uint8_t>(                                \
-            (config.read_stack(r.s) & ~flag::B) | flag::U);             \
-        r.s = static_cast<std::uint8_t>(r.s + 1);                       \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                          \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 3: {                                         \
-        base = config.read_stack(r.s);                                  \
-        r.s = static_cast<std::uint8_t>(r.s + 1);                       \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 4);                          \
-    }                                                                   \
-    [[fallthrough]];                                                    \
-    case ((OPCODE) << 3) | 4: {                                         \
-        pc = static_cast<std::uint16_t>(                                \
-            (base & 0x00FFu) |                                          \
-            (static_cast<std::uint16_t>(config.read_stack(r.s)) << 8)); \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                   \
-    }                                                                   \
-    [[fallthrough]];                                                    \
+#define TAWNY_RTI(OPCODE)                                                     \
+    case ((OPCODE) << 3) | 0: {                                               \
+        (void)config.read(addr);                                              \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        (void)config.read_stack(r.s);                                         \
+        ++r.s;                                                                \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        r.p = static_cast<std::uint8_t>(                                      \
+            (config.read_stack(r.s) & ~flag::B) | flag::U);                   \
+        ++r.s;                                                                \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        base = config.read_stack(r.s);                                        \
+        ++r.s;                                                                \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 4);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        pc = static_cast<std::uint16_t>(                                      \
+            (base & 0x00FFu) |                                                \
+            (config.read_stack(r.s) << 8));                                   \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
 
 // PHA / PHP — 3 cycles. Dummy operand read, push OP_CLASS::value(cpu),
 // fetch_opcode.
-#define TAWNY_PUSH(OPCODE, OP_CLASS)                  \
-    case ((OPCODE) << 3) | 0: {                       \
-        (void)config.read(addr);                      \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);        \
-    }                                                 \
-    [[fallthrough]];                                  \
-    case ((OPCODE) << 3) | 1: {                       \
-        config.write_stack(r.s, OP_CLASS::value(r));  \
-        r.s = static_cast<std::uint8_t>(r.s - 1);     \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2); \
-    }                                                 \
-    [[fallthrough]];                                  \
+#define TAWNY_PUSH(OPCODE, OP_CLASS)                                          \
+    case ((OPCODE) << 3) | 0: {                                               \
+        (void)config.read(addr);                                              \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        config.write_stack(r.s, OP_CLASS::value(r));                          \
+        --r.s;                                                                \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 2)
 
 // PLA / PLP — 4 cycles. Dummy operand read, dummy stack read (pre-increment),
 // pull byte and apply to CPU via OP_CLASS::apply(cpu, pulled), fetch_opcode.
-#define TAWNY_PULL(OPCODE, OP_CLASS)                  \
-    case ((OPCODE) << 3) | 0: {                       \
-        (void)config.read(addr);                      \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);        \
-    }                                                 \
-    [[fallthrough]];                                  \
-    case ((OPCODE) << 3) | 1: {                       \
-        (void)config.read_stack(r.s);                 \
-        r.s = static_cast<std::uint8_t>(r.s + 1);     \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);        \
-    }                                                 \
-    [[fallthrough]];                                  \
-    case ((OPCODE) << 3) | 2: {                       \
-        OP_CLASS::apply(r, config.read_stack(r.s));   \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3); \
-    }                                                 \
-    [[fallthrough]];                                  \
+#define TAWNY_PULL(OPCODE, OP_CLASS)                                          \
+    case ((OPCODE) << 3) | 0: {                                               \
+        (void)config.read(addr);                                              \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        (void)config.read_stack(r.s);                                         \
+        ++r.s;                                                                \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        OP_CLASS::apply(r, config.read_stack(r.s));                           \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
 
 // JAM — halts the CPU on an illegal opcode by redirecting the next phi2 back
@@ -1322,66 +1320,66 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 //   4: read vector low.
 //   5: read vector high, set PC, clear brk_flags.
 //   6: opcode fetch of the handler's first instruction.
-#define TAWNY_BRK(OPCODE)                                                 \
-    case ((OPCODE) << 3) | 0: {                                           \
-        (void)config.read(addr);                                          \
-        if (brk_flags == BrkFlags::None) {                                \
-            pc = static_cast<std::uint16_t>(pc + 1);                      \
-        }                                                                 \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                            \
-    }                                                                     \
-    [[fallthrough]];                                                      \
-    case ((OPCODE) << 3) | 1: {                                           \
-        if (brk_flags == BrkFlags::Reset) {                               \
-            (void)config.read_stack(r.s);                                 \
-        } else {                                                          \
-            config.write_stack(r.s, static_cast<std::uint8_t>(pc >> 8));  \
-        }                                                                 \
-        r.s = static_cast<std::uint8_t>(r.s - 1);                         \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                            \
-    }                                                                     \
-    [[fallthrough]];                                                      \
-    case ((OPCODE) << 3) | 2: {                                           \
-        if (brk_flags == BrkFlags::Reset) {                               \
-            (void)config.read_stack(r.s);                                 \
-        } else {                                                          \
-            config.write_stack(r.s, static_cast<std::uint8_t>(pc));       \
-        }                                                                 \
-        r.s = static_cast<std::uint8_t>(r.s - 1);                         \
-        TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                            \
-    }                                                                     \
-    [[fallthrough]];                                                      \
-    case ((OPCODE) << 3) | 3: {                                           \
-        if (brk_flags == BrkFlags::Reset) {                               \
-            (void)config.read_stack(r.s);                                 \
-        } else {                                                          \
-            std::uint8_t _pushed_p = (brk_flags == BrkFlags::None)        \
-                ? static_cast<std::uint8_t>(r.p | flag::B | flag::U)      \
-                : static_cast<std::uint8_t>(r.p | flag::U);               \
-            config.write_stack(r.s, _pushed_p);                           \
-        }                                                                 \
-        r.s = static_cast<std::uint8_t>(r.s - 1);                         \
-        r.p = static_cast<std::uint8_t>(r.p | flag::I);                   \
-        addr = (brk_flags == BrkFlags::Nmi)   ? 0xFFFAu                   \
-             : (brk_flags == BrkFlags::Reset) ? 0xFFFCu                   \
-             :                                  0xFFFEu;                  \
-        TAWNY_STEP_TAIL(access_cost_vector(addr), ((OPCODE) << 3) | 4);   \
-    }                                                                     \
-    [[fallthrough]];                                                      \
-    case ((OPCODE) << 3) | 4: {                                           \
-        base = config.read_vector(addr);                                  \
-        addr = static_cast<std::uint16_t>(addr + 1);                      \
-        TAWNY_STEP_TAIL(access_cost_vector(addr), ((OPCODE) << 3) | 5);   \
-    }                                                                     \
-    [[fallthrough]];                                                      \
-    case ((OPCODE) << 3) | 5: {                                           \
-        pc = static_cast<std::uint16_t>(                                  \
-            (base & 0x00FFu) |                                            \
-            (static_cast<std::uint16_t>(config.read_vector(addr)) << 8)); \
-        brk_flags = BrkFlags::None;                                       \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 6);                     \
-    }                                                                     \
-    [[fallthrough]];                                                      \
+#define TAWNY_BRK(OPCODE)                                                     \
+    case ((OPCODE) << 3) | 0: {                                               \
+        (void)config.read(addr);                                              \
+        if (brk_flags == BrkFlags::None) {                                    \
+            ++pc;                                                             \
+        }                                                                     \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        if (brk_flags == BrkFlags::Reset) {                                   \
+            (void)config.read_stack(r.s);                                     \
+        } else {                                                              \
+            config.write_stack(r.s, static_cast<std::uint8_t>(pc >> 8));      \
+        }                                                                     \
+        --r.s;                                                                \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        if (brk_flags == BrkFlags::Reset) {                                   \
+            (void)config.read_stack(r.s);                                     \
+        } else {                                                              \
+            config.write_stack(r.s, static_cast<std::uint8_t>(pc));           \
+        }                                                                     \
+        --r.s;                                                                \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 3);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        if (brk_flags == BrkFlags::Reset) {                                   \
+            (void)config.read_stack(r.s);                                     \
+        } else {                                                              \
+            std::uint8_t _pushed_p = (brk_flags == BrkFlags::None)            \
+                ? static_cast<std::uint8_t>(r.p | flag::B | flag::U)          \
+                : static_cast<std::uint8_t>(r.p | flag::U);                   \
+            config.write_stack(r.s, _pushed_p);                               \
+        }                                                                     \
+        --r.s;                                                                \
+        r.p = static_cast<std::uint8_t>(r.p | flag::I);                       \
+        addr = (brk_flags == BrkFlags::Nmi)   ? 0xFFFAu                       \
+             : (brk_flags == BrkFlags::Reset) ? 0xFFFCu                       \
+             :                                  0xFFFEu;                      \
+        TAWNY_STEP_TAIL(access_cost_vector(addr), ((OPCODE) << 3) | 4);       \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 4: {                                               \
+        base = config.read_vector(addr);                                      \
+        addr = static_cast<std::uint16_t>(addr + 1);                          \
+        TAWNY_STEP_TAIL(access_cost_vector(addr), ((OPCODE) << 3) | 5);       \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 5: {                                               \
+        pc = static_cast<std::uint16_t>(                                      \
+            (base & 0x00FFu) |                                                \
+            (config.read_vector(addr) << 8));                                 \
+        brk_flags = BrkFlags::None;                                           \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 6);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 6)
 
 // REL_BRANCH(OPCODE, COND) — 2/3/4 cycles. Three outcomes:
@@ -1392,46 +1390,46 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 // chain in step 0, so the common paths fall through with no tst write and
 // no re-dispatch via the switch.
 
-#define TAWNY_REL_BRANCH(OPCODE, COND)                                    \
-    case ((OPCODE) << 3) | 0: {                                           \
-        pc = static_cast<std::uint16_t>(pc + 1);                          \
-        /* _taken / _cross declared without initializers (scalars — legal \
-           to jump past), so the step-1 / step-2 case labels below can be \
-           reached via the switch without hitting a bypassed init. Both   \
-           are always assigned before they're read on any path. */        \
-        bool _taken;                                                      \
-        bool _cross;                                                      \
-        {                                                                 \
-            auto _off = static_cast<std::int8_t>(config.read(addr));      \
-            _taken = COND::taken(r);                                      \
-            if (_taken) {                                                 \
-                auto _tgt   = static_cast<std::uint16_t>(                 \
-                    pc + static_cast<std::int16_t>(_off));                \
-                auto _wrong = static_cast<std::uint16_t>(                 \
-                    (pc & 0xFF00u) | (_tgt & 0x00FFu));                   \
-                _cross = _wrong != _tgt;                                  \
-                pc = _cross ? _wrong : _tgt;                              \
-                if (_cross) base = _tgt;                                  \
-            }                                                             \
-        }                                                                 \
-        if (!_taken) {                                                    \
-            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                 \
-        } else if (!_cross) {                                             \
-            addr = pc;                                                    \
-            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);      \
-    case ((OPCODE) << 3) | 1:                                             \
-            (void)config.read(addr);                                      \
-            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                 \
-        } else {                                                          \
-            addr = pc;                                                    \
-            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);      \
-    case ((OPCODE) << 3) | 2:                                             \
-            (void)config.read(addr);                                      \
-            pc = base;                                                    \
-            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                 \
-        }                                                                 \
-    }                                                                     \
-    [[fallthrough]];                                                      \
+#define TAWNY_REL_BRANCH(OPCODE, COND)                                        \
+    case ((OPCODE) << 3) | 0: {                                               \
+        ++pc;                                                                 \
+        /* _taken / _cross declared without initializers (scalars — legal     \
+           to jump past), so the step-1 / step-2 case labels below can be     \
+           reached via the switch without hitting a bypassed init. Both       \
+           are always assigned before they're read on any path. */            \
+        bool _taken;                                                          \
+        bool _cross;                                                          \
+        {                                                                     \
+            auto _off = static_cast<std::int8_t>(config.read(addr));          \
+            _taken = COND::taken(r);                                          \
+            if (_taken) {                                                     \
+                auto _tgt   = static_cast<std::uint16_t>(                     \
+                    pc + static_cast<std::int16_t>(_off));                    \
+                auto _wrong = static_cast<std::uint16_t>(                     \
+                    (pc & 0xFF00u) | (_tgt & 0x00FFu));                       \
+                _cross = _wrong != _tgt;                                      \
+                pc = _cross ? _wrong : _tgt;                                  \
+                if (_cross) base = _tgt;                                      \
+            }                                                                 \
+        }                                                                     \
+        if (!_taken) {                                                        \
+            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                     \
+        } else if (!_cross) {                                                 \
+            addr = pc;                                                        \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);          \
+    case ((OPCODE) << 3) | 1:                                                 \
+            (void)config.read(addr);                                          \
+            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                     \
+        } else {                                                              \
+            addr = pc;                                                        \
+            TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);          \
+    case ((OPCODE) << 3) | 2:                                                 \
+            (void)config.read(addr);                                          \
+            pc = base;                                                        \
+            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                     \
+        }                                                                     \
+    }                                                                         \
+    [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
 
 // -----------------------------------------------------------------------------
