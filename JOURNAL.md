@@ -211,3 +211,28 @@ All 74 Dormann assertions still pass. Measured on AC (30-run Dormann median, bac
 - **Why Dormann is a pessimistic benchmark for this.** Dormann exercises every opcode systematically to catch bugs, so it's hitting the cold parts of the table more than real 6502 code would. A +9% improvement on Dormann suggests a bigger win on actual BBC Micro workloads, which use a much smaller hot subset.
 - **Hansotten's data comes from PET BASIC, not BBC Micro BASIC.** Close enough — the top-frequency opcodes are genuinely universal on 6502: `JSR`, `RTS`, `LDA zp`, `STA zp`, `LDA #`, branches, `CMP #`, stack ops. Any future workload-specific tuning (from a real BBC Micro trace) is a smaller follow-up.
 - **Comments preserve the frequency data inline.** Each legal case now carries a `// MNEMONIC addressing-mode (freq N)` comment. Handy as a sanity check during review and makes the layout intent obvious.
+
+## 2026-04-22 — Remaining illegal opcodes; strict warnings; cast tidy-up
+
+### What we did
+- Implemented the 18 stable illegal RMWs that had been JAM stubs (SLO/RLA/SRE/RRA/DCP/ISC in their `(zp,X)` / `(zp),Y` / `abs,Y` modes). Added three new macros: `TAWNY_AB_INDEXED_RMW` (generic; `TAWNY_ABX_RMW` / `TAWNY_ABY_RMW` now thin wrappers), `TAWNY_IZX_RMW` (8 cycles), `TAWNY_IZY_RMW` (8 cycles, always pays page-cross penalty).
+- Implemented the three unstable-but-read-only illegals (ANE 0x8B, LXA 0xAB, LAS 0xBB) using the conventional `0xEE` magic-constant approximation. Accuracy for these is inherently best-effort — they're analog-sensitive on real NMOS hardware and BBC Micro software never relied on them.
+- Left as JAM: the 12 true KIL/HLT opcodes (hardware-accurate) and the 5 SH*/TAS variants (0x93, 0x9B, 0x9C, 0x9E, 0x9F). The latter need the pre-index high byte preserved across the write step; deferred until we hit software that actually needs them.
+- Enabled `-Wall -Wextra -Werror` (and `/W4 /WX` for MSVC). Build is clean — no warnings.
+- Cleaned up redundant casts throughout `m6502.h`: `pc = static_cast<std::uint16_t>(pc + 1)` → `++pc` (33 sites); `r.s = static_cast<std::uint8_t>(r.s ± 1)` → `++r.s` / `--r.s` (12 sites); dropped inner `static_cast<std::uint16_t>(config.read*(...))` before shifts (the shift promotes to int anyway, outer cast narrows back to u16); dropped `addr = static_cast<std::uint16_t>(config.read(addr))` since u8→u16 widening is implicit.
+- Aligned all macro line-continuation backslashes to column 79 file-wide, replacing the previous per-macro max-width alignment.
+- Performance: the ~4 KB of new illegal-opcode case bodies cost ~5-10% on Dormann (it exercises all 256 tstates systematically, so more code to linearly lay out). Real BBC Micro workloads use a much smaller hot subset and should be unaffected.
+
+### Design decisions
+- **Why implement illegal opcodes at all.** BBC Micro software is overwhelmingly plain NMOS 6502, but a handful of games and demos used illegal opcodes either deliberately (for smaller code) or accidentally (via miscoded data). Having them work correctly means "runs real-world software" doesn't depend on us having seen that specific program before.
+- **Magic constant for ANE / LXA.** The true behaviour is analog: `A = (A | <bus-capacitance-dependent>) & X & imm` where the capacitance value varies by CPU variant and temperature. Common emulator choices are 0xEE or 0xFF; we use 0xEE. If a specific title exhibits different behaviour on the real machine, this is the first knob to tweak.
+- **Why `-Werror` now and not sooner.** The codebase is small enough that cleaning up warnings is a bounded task, and the fall-through dispatch macros in `m6502.h` benefit from strict type-mismatch and narrowing checks to catch accidental misalignments between case-step numbers, tstate encodings, and operand widths. Turning `-Werror` on early surfaces these before they drift.
+- **Backslash-alignment column is the max across the whole file, not per-macro.** Per-macro alignment looks fine in isolation but creates visual "steps" when reading through the file. A single file-wide column is uniform and trivial to re-establish when any macro grows: re-run the align pass. Current column is 79; if a future macro pushes max content beyond 77 chars, bump the column and realign globally.
+- **Dormann is a stress-test, not a typical workload.** The 5–10% Dormann regression from adding 4 KB of code reflects that Dormann hits literally every opcode in the function. Real BBC Micro code exercises maybe 30-50 distinct opcodes heavily and spends almost no time on illegal opcode cases, which means the icache is dominated by the frequency-sorted hot region at the top of the function — the illegal cases at the bottom don't compete with it in practice. If we ever find a real workload regressing, the next move would be out-of-lining the illegal block into a helper reached via `default:`.
+
+### What's still missing from the CPU emulation
+Captured in CLAUDE.md's "What still needs doing on the CPU core" section, summarised:
+- **IRQ / NMI pipeline** (the big one). `sample_interrupts()` is a stub. BRK microcode already branches on `brk_flags` for all four entry paths (Reset/IRQ/NMI/software BRK) — adding interrupts is plumbing: `int_shift` latency register, NMI edge detection, and a real `sample_interrupts()` that queues BRK entry for the next instruction boundary.
+- **SH* / TAS illegals** (5 opcodes) — tracked as a follow-up; minor since BBC Micro never used them.
+- **Public `reset()` mid-run** — a small addition if needed.
+- **RDY / SO pins, 65C02/65816** — out of scope for a BBC Micro NMOS emulator.
