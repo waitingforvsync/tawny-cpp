@@ -164,7 +164,7 @@ Before landing on `Registers&`, the session explored two other shapes, both disc
 - **`set_pc` leaves registers untouched.** Two options: copy reset's init (`a = x = y = 0; s = 0; p = flag::U`) or preserve whatever's there. Preserved won. `set_pc` is the "jump PC without going through reset" primitive; callers who want a reset-like state can call `reset()` first, then `set_pc()`. For the Dormann test specifically the test initialises its own registers (`LDX #$FF; TXS; CLD`) from the very first instructions, so the starting register state doesn't matter.
 - **Pre-paying the opcode fetch mirrors `reset()`.** Reset sets `cycle = config.access_cost(pending_addr).cost` so the first `run_until` iteration jumps straight into phi2 with no bootstrap branch. `set_pc` does the same thing but uses `access_cost_opcode` since the first phi2 on the set_pc path is an opcode fetch rather than a generic read. Without the pre-pay, the opcode-fetch cost wouldn't be charged — the synthetic case only pays for the *next* access (the operand fetch) via `TAWNY_STEP_TAIL`.
 
-## 2026-04-21 — Fall-through dispatch for optional steps: `abs,X/Y`, `(zp),Y`, branches
+## 2026-04-22 — Fall-through dispatch for optional steps: `abs,X/Y`, `(zp),Y`, branches
 
 ### What we did
 Rewrote three macros so that the *variable-cycle* steps — page-cross fix-ups on indexed reads, and the three-way branch dispatch — no longer go through the switch's jump table on the common (no-penalty) path. Case labels for the penalty cycles now live *inside* the `if` branches that require them, so the common path falls straight through to the next step with no `tst` write, no `break`, and no indirect re-dispatch:
@@ -173,7 +173,15 @@ Rewrote three macros so that the *variable-cycle* steps — page-cross fix-ups o
 - **`TAWNY_IZY_READ`** (`LDA (zp),Y`, every `(zp),Y` read). Same optimisation, applied to step 2's page-cross check.
 - **`TAWNY_REL_BRANCH`** (all conditional branches). Originally a three-way dispatch: not-taken → step 3, taken-no-cross → step 1, taken-cross → step 2. Now all three outcomes are expressed inline in step 0's `if / else if / else`, with the step-1 and step-2 case labels nested inside the relevant branches. Not-taken branches (the most common case for many loops) fall straight through to the fetch step with no re-dispatch at all.
 
-All 15 test cases / 74 assertions still pass. Perf reading deferred until we can measure on AC.
+All 15 test cases / 74 assertions still pass. Measured on AC (30-run Dormann profile, Release, AMD Ryzen 7 5800H):
+
+| Stage                                          | Median    | Range          |
+|---                                             | ---       | ---            |
+| `7aa1b93` (session start — RegView + break dispatch) | ~815 MHz  | 703–864 MHz    |
+| `194eda0` (after RegView → Registers&)         | ~890 MHz  | 816–960 MHz    |
+| `887bae4` (after fall-through dispatch — current HEAD) | **~1090 MHz** | **998–1160 MHz** |
+
+So the two optimisations land **+34% / ~275 MHz** over where we started the session, with fall-through dispatch contributing roughly two-thirds of the gain.
 
 ### Design decisions
 - **Case labels inside `if` blocks.** Legal in both C and C++ — the switch's jump table just needs to know the label's address; it can live anywhere inside the switch body. This is Duff's-device territory, rarely seen in idiomatic code but exactly the right tool here. Mid-instruction re-entry dispatches to the label directly, bypassing the enclosing `if` condition (which we don't need to re-check because the state-machine step implies the branch).
