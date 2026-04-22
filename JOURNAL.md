@@ -188,3 +188,26 @@ So the two optimisations land **+34% / ~275 MHz** over where we started the sess
 - **Narrow scopes to avoid "jump bypasses variable initialization".** The C++ rule: you can't jump past a declaration-with-initialisation to a point where that variable is in scope, unless the type is scalar *and* the variable has no initialiser. The page-cross branches compute intermediate values (`_hi`, `_lo_sum`, `_off`, `_tgt`, `_wrong`) with `auto` initialisers. To let the nested case labels jump over these, we put the computations in an inner block scope so the variables go out of scope before the case label is reached. The `_cross` / `_taken` booleans that carry information across the block boundary are declared without initialisers (scalar, no init = legal to bypass) and always assigned before being read on any path that reads them.
 - **Branch encoding merges `_cross` into the outer `if / else if / else`.** The first sketch had nested ifs (`if (taken) { if (cross) … else … }`), which works but complicates the jump-bypass analysis because the case labels are nested two deep. Flattening to a three-way `if / else if / else` puts step-1 and step-2 case labels at the same block level; cleaner and easier for the compiler to reason about.
 - **Why this optimisation is load-bearing.** The Dormann functional test exercises `LDA/STA/CMP abs,X/Y`, `LDA/STA (zp),Y`, and every conditional branch heavily — many hundreds of millions of times across the 96M-cycle run. Each hot-path case body previously ended in an indirect jump back to the top of the switch; now it ends in a fall-through (a straight-line step or `jmp` to the immediately-following case body). Removes an indirect branch per instruction on a huge fraction of all dispatches.
+
+## 2026-04-22 — Opcode-table reorder by frequency: +9% to ~1200 MHz
+
+### What we did
+Reordered the 256-entry switch in `run_until` so that legal opcodes are defined in descending frequency order, and illegal opcodes (JAMs + stable illegals) trail at the end in numeric order. Frequency data comes from Table 3 in Hansotten's *Analysis of the Use of the 6502's Opcodes* (a 6355-instruction PET BASIC ROM sample). The top of the table is now `JSR / STA zp / LDA zp / BNE / LDA # / BEQ / JMP abs / LDY # / CMP # / PLA / RTS / STY zp / PHA / BCC / INY / STX zp / LDX # / LDA (zp),Y / ...` — matching what actual 6502 programs spend most of their cycles on.
+
+All 74 Dormann assertions still pass. Measured on AC (30-run Dormann median, back-to-back A/B):
+
+| Layout                           | Median    | Range          |
+|---                               | ---       | ---            |
+| Numeric order (prior HEAD)       | ~1095 MHz | 1047–1199 MHz  |
+| **Frequency order (current)**    | **~1200 MHz** | **1169–1287 MHz** |
+
++9% / ~100 MHz. Stable across multiple runs.
+
+### What we tried and walked away from
+- **Naïve "legal first, illegal last" in numeric order** (no frequency sort): actually *regressed* by ~9%. Grouping legal opcodes together wasn't enough — the legal group is still dominated by the numeric-order layout of the ALU-ish opcodes (`AND/ORA/EOR/...`) that aren't especially hot in real code, while actually-hot opcodes (`JSR / LDA / BNE / STA`) were scattered across it. Moved the bytes around without packing the hot ones.
+
+### Design decisions
+- **Why frequency-sorting helps.** Each opcode's case body is ~30–150 bytes of x86 (steps + horizon checks + op body), so run_until weighs in at ~46 KB — bigger than the 32 KB L1 I-cache on Zen 3. Source-order determines linear layout, and the linear layout determines which cases share cache lines. Sorting by frequency packs the hot cases (which together consume the bulk of execution) into a small contiguous region that fits comfortably in L1, letting the cold cases (rare legal ops + every illegal stub) spill into L2 without hurting the hot path. The jump table itself is indexed by `tst = (opcode << 3) | step`, so the encoding/decoding doesn't care about source order at all — only the code layout does.
+- **Why Dormann is a pessimistic benchmark for this.** Dormann exercises every opcode systematically to catch bugs, so it's hitting the cold parts of the table more than real 6502 code would. A +9% improvement on Dormann suggests a bigger win on actual BBC Micro workloads, which use a much smaller hot subset.
+- **Hansotten's data comes from PET BASIC, not BBC Micro BASIC.** Close enough — the top-frequency opcodes are genuinely universal on 6502: `JSR`, `RTS`, `LDA zp`, `STA zp`, `LDA #`, branches, `CMP #`, stack ops. Any future workload-specific tuning (from a real BBC Micro trace) is a smaller follow-up.
+- **Comments preserve the frequency data inline.** Each legal case now carries a `// MNEMONIC addressing-mode (freq N)` comment. Handy as a sanity check during review and makes the layout intent obvious.
