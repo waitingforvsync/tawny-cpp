@@ -299,6 +299,36 @@ struct Axs {
 // USBC: bit-equivalent to SBC.
 struct Usbc { static void apply(Registers &r, std::uint8_t v) { Sbc::apply(r, v); } };
 
+// ---- Unstable illegal ops (analog behaviour on real hardware — emulated
+// here with the magic-constant approximation common to NMOS emulators).
+// Virtually never used by legitimate software; accuracy beyond "doesn't
+// crash" isn't a goal for a BBC Micro.
+
+// ANE (0x8B, aka XAA): A = (A | magic) & X & imm. Magic is CPU-specific
+// (commonly 0xEE on 6502, 0xEF on 6510).
+struct Ane { static void apply(Registers &r, std::uint8_t v) {
+    auto result = static_cast<std::uint8_t>((r.a | 0xEEu) & r.x & v);
+    r.a = result;
+    set_nz(r, result);
+} };
+
+// LXA (0xAB): A = X = (A | magic) & imm.
+struct Lxa { static void apply(Registers &r, std::uint8_t v) {
+    auto result = static_cast<std::uint8_t>((r.a | 0xEEu) & v);
+    r.a = result;
+    r.x = result;
+    set_nz(r, result);
+} };
+
+// LAS (0xBB, aka LAR): A = X = S = mem & S.
+struct Las { static void apply(Registers &r, std::uint8_t v) {
+    auto result = static_cast<std::uint8_t>(v & r.s);
+    r.a = result;
+    r.x = result;
+    r.s = result;
+    set_nz(r, result);
+} };
+
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
@@ -931,49 +961,157 @@ struct Usbc { static void apply(Registers &r, std::uint8_t v) { Sbc::apply(r, v)
     [[fallthrough]];                                                \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
 
-#define TAWNY_ABX_RMW(OPCODE, OP_CLASS)                               \
-    case ((OPCODE) << 3) | 0: {                                       \
-        pc = static_cast<std::uint16_t>(pc + 1);                      \
-        base = config.read(addr);                                     \
-        addr = pc;                                                    \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);      \
-    }                                                                 \
-    [[fallthrough]];                                                  \
-    case ((OPCODE) << 3) | 1: {                                       \
-        pc = static_cast<std::uint16_t>(pc + 1);                      \
-        auto _hi     = config.read(addr);                             \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.x); \
-        addr = static_cast<std::uint16_t>(                            \
-            (_hi << 8) | (_lo_sum & 0x00FFu));                        \
-        base = static_cast<std::uint16_t>(                            \
-            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                      \
-            (_lo_sum & 0x00FFu));                                     \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);      \
-    }                                                                 \
-    [[fallthrough]];                                                  \
-    case ((OPCODE) << 3) | 2: {                                       \
-        (void)config.read(addr);                                      \
-        addr = base;                                                  \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);      \
-    }                                                                 \
-    [[fallthrough]];                                                  \
-    case ((OPCODE) << 3) | 3: {                                       \
-        base = config.read(addr);                                     \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);      \
-    }                                                                 \
-    [[fallthrough]];                                                  \
-    case ((OPCODE) << 3) | 4: {                                       \
-        config.write(addr, static_cast<std::uint8_t>(base));          \
-        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));   \
-        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);      \
-    }                                                                 \
-    [[fallthrough]];                                                  \
-    case ((OPCODE) << 3) | 5: {                                       \
-        config.write(addr, static_cast<std::uint8_t>(base));          \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 6);                 \
-    }                                                                 \
-    [[fallthrough]];                                                  \
+#define TAWNY_AB_INDEXED_RMW(OPCODE, OP_CLASS, IDX)                     \
+    case ((OPCODE) << 3) | 0: {                                         \
+        pc = static_cast<std::uint16_t>(pc + 1);                        \
+        base = config.read(addr);                                       \
+        addr = pc;                                                      \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);        \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 1: {                                         \
+        pc = static_cast<std::uint16_t>(pc + 1);                        \
+        auto _hi     = config.read(addr);                               \
+        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX)); \
+        addr = static_cast<std::uint16_t>(                              \
+            (_hi << 8) | (_lo_sum & 0x00FFu));                          \
+        base = static_cast<std::uint16_t>(                              \
+            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                        \
+            (_lo_sum & 0x00FFu));                                       \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);        \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 2: {                                         \
+        (void)config.read(addr);                                        \
+        addr = base;                                                    \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);        \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 3: {                                         \
+        base = config.read(addr);                                       \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);        \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 4: {                                         \
+        config.write(addr, static_cast<std::uint8_t>(base));            \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));     \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);        \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 5: {                                         \
+        config.write(addr, static_cast<std::uint8_t>(base));            \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 6);                   \
+    }                                                                   \
+    [[fallthrough]];                                                    \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 6)
+
+#define TAWNY_ABX_RMW(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_RMW(OPCODE, OP_CLASS, r.x)
+#define TAWNY_ABY_RMW(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_RMW(OPCODE, OP_CLASS, r.y)
+
+// IZX_RMW — 8 cycles. Indexed-indirect (zp,X) RMW.
+#define TAWNY_IZX_RMW(OPCODE, OP_CLASS)                                 \
+    case ((OPCODE) << 3) | 0: {                                         \
+        pc = static_cast<std::uint16_t>(pc + 1);                        \
+        auto _zp = config.read(addr);                                   \
+        base = static_cast<std::uint16_t>(                              \
+            static_cast<std::uint8_t>(_zp + r.x));                      \
+        addr = static_cast<std::uint16_t>(_zp);                         \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),\
+                        ((OPCODE) << 3) | 1);                           \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 1: {                                         \
+        (void)config.read_zp(static_cast<std::uint8_t>(addr));          \
+        addr = base;                                                    \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),\
+                        ((OPCODE) << 3) | 2);                           \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 2: {                                         \
+        base = config.read_zp(static_cast<std::uint8_t>(addr));         \
+        addr = static_cast<std::uint16_t>(                              \
+            static_cast<std::uint8_t>(addr + 1));                       \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),\
+                        ((OPCODE) << 3) | 3);                           \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 3: {                                         \
+        addr = static_cast<std::uint16_t>(                              \
+            (base & 0x00FFu) |                                          \
+            (static_cast<std::uint16_t>(                                \
+                config.read_zp(static_cast<std::uint8_t>(addr))) << 8));\
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);        \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 4: {                                         \
+        base = config.read(addr);                                       \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);        \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 5: {                                         \
+        config.write(addr, static_cast<std::uint8_t>(base));            \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));     \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 6);        \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 6: {                                         \
+        config.write(addr, static_cast<std::uint8_t>(base));            \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 7);                   \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    TAWNY_FETCH_OPCODE_CASE(OPCODE, 7)
+
+// IZY_RMW — 8 cycles. Always pays the page-cross fix-up (like IZY_WRITE).
+#define TAWNY_IZY_RMW(OPCODE, OP_CLASS)                                 \
+    case ((OPCODE) << 3) | 0: {                                         \
+        pc = static_cast<std::uint16_t>(pc + 1);                        \
+        addr = static_cast<std::uint16_t>(config.read(addr));           \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),\
+                        ((OPCODE) << 3) | 1);                           \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 1: {                                         \
+        base = config.read_zp(static_cast<std::uint8_t>(addr));         \
+        addr = static_cast<std::uint16_t>(                              \
+            static_cast<std::uint8_t>(addr + 1));                       \
+        TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),\
+                        ((OPCODE) << 3) | 2);                           \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 2: {                                         \
+        auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr)); \
+        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);   \
+        addr = static_cast<std::uint16_t>(                              \
+            (_hi << 8) | (_lo_sum & 0x00FFu));                          \
+        base = static_cast<std::uint16_t>(                              \
+            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                        \
+            (_lo_sum & 0x00FFu));                                       \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);        \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 3: {                                         \
+        (void)config.read(addr);                                        \
+        addr = base;                                                    \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);        \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 4: {                                         \
+        base = config.read(addr);                                       \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);        \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 5: {                                         \
+        config.write(addr, static_cast<std::uint8_t>(base));            \
+        base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));     \
+        TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 6);        \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    case ((OPCODE) << 3) | 6: {                                         \
+        config.write(addr, static_cast<std::uint8_t>(base));            \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 7);                   \
+    }                                                                   \
+    [[fallthrough]];                                                    \
+    TAWNY_FETCH_OPCODE_CASE(OPCODE, 7)
 
 // JMP (indirect) — 5 cycles. The NMOS 6502 has a well-known page-wrap bug:
 // when the pointer low byte is at $xxFF, the high byte is fetched from $xx00
@@ -1583,59 +1721,59 @@ struct M6502 {
 
                 // Illegal opcodes (JAM stubs + stable illegals) in numeric order.
                 TAWNY_JAM       (0x02)                       // JAM*
-                TAWNY_JAM       (0x03)                       // SLO (zp,X)* — TODO izx RMW
+                TAWNY_IZX_RMW   (0x03, detail::Slo)          // SLO (zp,X)*
                 TAWNY_ZP_READ   (0x04, detail::Nop)          // NOP zp*
                 TAWNY_ZP_RMW    (0x07, detail::Slo)          // SLO zp*
                 TAWNY_IMM_READ  (0x0B, detail::Anc)          // ANC #*
                 TAWNY_ABS_READ  (0x0C, detail::Nop)          // NOP abs*
                 TAWNY_ABS_RMW   (0x0F, detail::Slo)          // SLO abs*
                 TAWNY_JAM       (0x12)                       // JAM*
-                TAWNY_JAM       (0x13)                       // SLO (zp),Y* — TODO izy RMW
+                TAWNY_IZY_RMW   (0x13, detail::Slo)          // SLO (zp),Y*
                 TAWNY_ZPX_READ  (0x14, detail::Nop)          // NOP zp,X*
                 TAWNY_ZPX_RMW   (0x17, detail::Slo)          // SLO zp,X*
                 TAWNY_IMPLIED   (0x1A, detail::Nop)          // NOP*
-                TAWNY_JAM       (0x1B)                       // SLO abs,Y* — TODO aby RMW
+                TAWNY_ABY_RMW   (0x1B, detail::Slo)          // SLO abs,Y*
                 TAWNY_ABX_READ  (0x1C, detail::Nop)          // NOP abs,X*
                 TAWNY_ABX_RMW   (0x1F, detail::Slo)          // SLO abs,X*
                 TAWNY_JAM       (0x22)                       // JAM*
-                TAWNY_JAM       (0x23)                       // RLA (zp,X)* — TODO izx RMW
+                TAWNY_IZX_RMW   (0x23, detail::Rla)          // RLA (zp,X)*
                 TAWNY_ZP_RMW    (0x27, detail::Rla)          // RLA zp*
                 TAWNY_IMM_READ  (0x2B, detail::Anc)          // ANC #*
                 TAWNY_ABS_RMW   (0x2F, detail::Rla)          // RLA abs*
                 TAWNY_JAM       (0x32)                       // JAM*
-                TAWNY_JAM       (0x33)                       // RLA (zp),Y* — TODO
+                TAWNY_IZY_RMW   (0x33, detail::Rla)          // RLA (zp),Y*
                 TAWNY_ZPX_READ  (0x34, detail::Nop)          // NOP zp,X*
                 TAWNY_ZPX_RMW   (0x37, detail::Rla)          // RLA zp,X*
                 TAWNY_IMPLIED   (0x3A, detail::Nop)          // NOP*
-                TAWNY_JAM       (0x3B)                       // RLA abs,Y*
+                TAWNY_ABY_RMW   (0x3B, detail::Rla)          // RLA abs,Y*
                 TAWNY_ABX_READ  (0x3C, detail::Nop)          // NOP abs,X*
                 TAWNY_ABX_RMW   (0x3F, detail::Rla)          // RLA abs,X*
                 TAWNY_JAM       (0x42)                       // JAM*
-                TAWNY_JAM       (0x43)                       // SRE (zp,X)*
+                TAWNY_IZX_RMW   (0x43, detail::Sre)          // SRE (zp,X)*
                 TAWNY_ZP_READ   (0x44, detail::Nop)          // NOP zp*
                 TAWNY_ZP_RMW    (0x47, detail::Sre)          // SRE zp*
                 TAWNY_IMM_READ  (0x4B, detail::Alr)          // ALR #*
                 TAWNY_ABS_RMW   (0x4F, detail::Sre)          // SRE abs*
                 TAWNY_JAM       (0x52)                       // JAM*
-                TAWNY_JAM       (0x53)                       // SRE (zp),Y*
+                TAWNY_IZY_RMW   (0x53, detail::Sre)          // SRE (zp),Y*
                 TAWNY_ZPX_READ  (0x54, detail::Nop)          // NOP zp,X*
                 TAWNY_ZPX_RMW   (0x57, detail::Sre)          // SRE zp,X*
                 TAWNY_IMPLIED   (0x5A, detail::Nop)          // NOP*
-                TAWNY_JAM       (0x5B)                       // SRE abs,Y*
+                TAWNY_ABY_RMW   (0x5B, detail::Sre)          // SRE abs,Y*
                 TAWNY_ABX_READ  (0x5C, detail::Nop)          // NOP abs,X*
                 TAWNY_ABX_RMW   (0x5F, detail::Sre)          // SRE abs,X*
                 TAWNY_JAM       (0x62)                       // JAM*
-                TAWNY_JAM       (0x63)                       // RRA (zp,X)*
+                TAWNY_IZX_RMW   (0x63, detail::Rra)          // RRA (zp,X)*
                 TAWNY_ZP_READ   (0x64, detail::Nop)          // NOP zp*
                 TAWNY_ZP_RMW    (0x67, detail::Rra)          // RRA zp*
                 TAWNY_IMM_READ  (0x6B, detail::Arr)          // ARR #*
                 TAWNY_ABS_RMW   (0x6F, detail::Rra)          // RRA abs*
                 TAWNY_JAM       (0x72)                       // JAM*
-                TAWNY_JAM       (0x73)                       // RRA (zp),Y*
+                TAWNY_IZY_RMW   (0x73, detail::Rra)          // RRA (zp),Y*
                 TAWNY_ZPX_READ  (0x74, detail::Nop)          // NOP zp,X*
                 TAWNY_ZPX_RMW   (0x77, detail::Rra)          // RRA zp,X*
                 TAWNY_IMPLIED   (0x7A, detail::Nop)          // NOP*
-                TAWNY_JAM       (0x7B)                       // RRA abs,Y*
+                TAWNY_ABY_RMW   (0x7B, detail::Rra)          // RRA abs,Y*
                 TAWNY_ABX_READ  (0x7C, detail::Nop)          // NOP abs,X*
                 TAWNY_ABX_RMW   (0x7F, detail::Rra)          // RRA abs,X*
                 TAWNY_IMM_READ  (0x80, detail::Nop)          // NOP #*
@@ -1643,7 +1781,7 @@ struct M6502 {
                 TAWNY_IZX_WRITE (0x83, detail::Sax)          // SAX (zp,X)*
                 TAWNY_ZP_WRITE  (0x87, detail::Sax)          // SAX zp*
                 TAWNY_IMM_READ  (0x89, detail::Nop)          // NOP #*
-                TAWNY_JAM       (0x8B)                       // ANE #!
+                TAWNY_IMM_READ  (0x8B, detail::Ane)          // ANE #! (unstable)
                 TAWNY_ABS_WRITE (0x8F, detail::Sax)          // SAX abs*
                 TAWNY_JAM       (0x92)                       // JAM*
                 TAWNY_JAM       (0x93)                       // SHA (zp),Y!
@@ -1654,37 +1792,37 @@ struct M6502 {
                 TAWNY_JAM       (0x9F)                       // SHA abs,Y!
                 TAWNY_IZX_READ  (0xA3, detail::Lax)          // LAX (zp,X)*
                 TAWNY_ZP_READ   (0xA7, detail::Lax)          // LAX zp*
-                TAWNY_JAM       (0xAB)                       // LXA #!
+                TAWNY_IMM_READ  (0xAB, detail::Lxa)          // LXA #! (unstable)
                 TAWNY_ABS_READ  (0xAF, detail::Lax)          // LAX abs*
                 TAWNY_JAM       (0xB2)                       // JAM*
                 TAWNY_IZY_READ  (0xB3, detail::Lax)          // LAX (zp),Y*
                 TAWNY_ZPY_READ  (0xB7, detail::Lax)          // LAX zp,Y*
-                TAWNY_JAM       (0xBB)                       // LAS abs,Y!
+                TAWNY_ABY_READ  (0xBB, detail::Las)          // LAS abs,Y! (unstable)
                 TAWNY_ABY_READ  (0xBF, detail::Lax)          // LAX abs,Y*
                 TAWNY_IMM_READ  (0xC2, detail::Nop)          // NOP #*
-                TAWNY_JAM       (0xC3)                       // DCP (zp,X)* — TODO
+                TAWNY_IZX_RMW   (0xC3, detail::Dcp)          // DCP (zp,X)*
                 TAWNY_ZP_RMW    (0xC7, detail::Dcp)          // DCP zp*
                 TAWNY_IMM_READ  (0xCB, detail::Axs)          // AXS #*
                 TAWNY_ABS_RMW   (0xCF, detail::Dcp)          // DCP abs*
                 TAWNY_JAM       (0xD2)                       // JAM*
-                TAWNY_JAM       (0xD3)                       // DCP (zp),Y*
+                TAWNY_IZY_RMW   (0xD3, detail::Dcp)          // DCP (zp),Y*
                 TAWNY_ZPX_READ  (0xD4, detail::Nop)          // NOP zp,X*
                 TAWNY_ZPX_RMW   (0xD7, detail::Dcp)          // DCP zp,X*
                 TAWNY_IMPLIED   (0xDA, detail::Nop)          // NOP*
-                TAWNY_JAM       (0xDB)                       // DCP abs,Y*
+                TAWNY_ABY_RMW   (0xDB, detail::Dcp)          // DCP abs,Y*
                 TAWNY_ABX_READ  (0xDC, detail::Nop)          // NOP abs,X*
                 TAWNY_ABX_RMW   (0xDF, detail::Dcp)          // DCP abs,X*
                 TAWNY_IMM_READ  (0xE2, detail::Nop)          // NOP #*
-                TAWNY_JAM       (0xE3)                       // ISC (zp,X)*
+                TAWNY_IZX_RMW   (0xE3, detail::Isc)          // ISC (zp,X)*
                 TAWNY_ZP_RMW    (0xE7, detail::Isc)          // ISC zp*
                 TAWNY_IMM_READ  (0xEB, detail::Usbc)         // USBC #*
                 TAWNY_ABS_RMW   (0xEF, detail::Isc)          // ISC abs*
                 TAWNY_JAM       (0xF2)                       // JAM*
-                TAWNY_JAM       (0xF3)                       // ISC (zp),Y*
+                TAWNY_IZY_RMW   (0xF3, detail::Isc)          // ISC (zp),Y*
                 TAWNY_ZPX_READ  (0xF4, detail::Nop)          // NOP zp,X*
                 TAWNY_ZPX_RMW   (0xF7, detail::Isc)          // ISC zp,X*
                 TAWNY_IMPLIED   (0xFA, detail::Nop)          // NOP*
-                TAWNY_JAM       (0xFB)                       // ISC abs,Y*
+                TAWNY_ABY_RMW   (0xFB, detail::Isc)          // ISC abs,Y*
                 TAWNY_ABX_READ  (0xFC, detail::Nop)          // NOP abs,X*
                 TAWNY_ABX_RMW   (0xFF, detail::Isc)          // ISC abs,X*
 
@@ -1749,7 +1887,11 @@ struct M6502 {
 #undef TAWNY_ZP_RMW
 #undef TAWNY_ZPX_RMW
 #undef TAWNY_ABS_RMW
+#undef TAWNY_AB_INDEXED_RMW
 #undef TAWNY_ABX_RMW
+#undef TAWNY_ABY_RMW
+#undef TAWNY_IZX_RMW
+#undef TAWNY_IZY_RMW
 #undef TAWNY_JMP_IND
 #undef TAWNY_JSR
 #undef TAWNY_RTS
