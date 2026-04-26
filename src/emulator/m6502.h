@@ -408,30 +408,34 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 
 #define TAWNY_FETCH_OPCODE_CASE(OPCODE, STEP)                                 \
     case ((OPCODE) << 3) | (STEP): {                                          \
-        auto _take_int = int_cycle <= current;                                \
-        auto _opcode   = config.read_opcode(addr);                            \
-        pc            += !_take_int;                                          \
-        tst            = static_cast<std::uint16_t>(                          \
-                            !_take_int * (_opcode << 3));                     \
-        addr           = pc;                                                  \
+        auto _opcode = config.read_opcode(addr);                              \
+        if (int_cycle <= current) {                                           \
+            tst = 0;                                                          \
+        } else {                                                              \
+            ++pc;                                                             \
+            tst = static_cast<std::uint16_t>(_opcode << 3);                   \
+        }                                                                     \
+        addr = pc;                                                            \
         TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
         break;                                                                \
     }
 
-// FETCH_OPCODE_CASE_DEFER_I — for SEI / CLI / PLP, whose I-flag change is
-// "delayed" per NESdev: the boundary poll uses pre-instruction I, and only
-// the *next* instruction's poll sees the new I. Same body as default plus
-// an int_cycle update *after* the take_int test.
+// FETCH_OPCODE_CASE_DEFER_I — for BRK's handler-first FETCH; recomputes
+// int_cycle from r.p *after* the take_int test (NESdev's "delayed I" rule
+// for SEI/CLI/PLP also routes here historically — they now use dedicated
+// macros to also condition the I commit on !take_int).
 
 #define TAWNY_FETCH_OPCODE_CASE_DEFER_I(OPCODE, STEP)                         \
     case ((OPCODE) << 3) | (STEP): {                                          \
-        auto _take_int = int_cycle <= current;                                \
-        auto _opcode   = config.read_opcode(addr);                            \
-        pc            += !_take_int;                                          \
-        tst            = static_cast<std::uint16_t>(                          \
-                            !_take_int * (_opcode << 3));                     \
-        addr           = pc;                                                  \
-        int_cycle      = recompute_int_cycle();                               \
+        auto _opcode = config.read_opcode(addr);                              \
+        if (int_cycle <= current) {                                           \
+            tst = 0;                                                          \
+        } else {                                                              \
+            ++pc;                                                             \
+            tst = static_cast<std::uint16_t>(_opcode << 3);                   \
+        }                                                                     \
+        addr      = pc;                                                       \
+        int_cycle = recompute_int_cycle();                                    \
         TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
         break;                                                                \
     }
@@ -442,13 +446,15 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 
 #define TAWNY_FETCH_OPCODE_CASE_IMMEDIATE_I(OPCODE, STEP)                     \
     case ((OPCODE) << 3) | (STEP): {                                          \
-        int_cycle      = recompute_int_cycle();                               \
-        auto _take_int = int_cycle <= current;                                \
-        auto _opcode   = config.read_opcode(addr);                            \
-        pc            += !_take_int;                                          \
-        tst            = static_cast<std::uint16_t>(                          \
-                            !_take_int * (_opcode << 3));                     \
-        addr           = pc;                                                  \
+        int_cycle    = recompute_int_cycle();                                 \
+        auto _opcode = config.read_opcode(addr);                              \
+        if (int_cycle <= current) {                                           \
+            tst = 0;                                                          \
+        } else {                                                              \
+            ++pc;                                                             \
+            tst = static_cast<std::uint16_t>(_opcode << 3);                   \
+        }                                                                     \
+        addr = pc;                                                            \
         TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
         break;                                                                \
     }
@@ -462,12 +468,14 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 
 #define TAWNY_FETCH_OPCODE_CASE_BRANCH_NOCROSS(OPCODE, STEP)                  \
     case ((OPCODE) << 3) | (STEP): {                                          \
-        auto _take_int = int_cycle + 2 <= current;                            \
-        auto _opcode   = config.read_opcode(addr);                            \
-        pc            += !_take_int;                                          \
-        tst            = static_cast<std::uint16_t>(                          \
-                            !_take_int * (_opcode << 3));                     \
-        addr           = pc;                                                  \
+        auto _opcode = config.read_opcode(addr);                              \
+        if (int_cycle + 2 <= current) {                                       \
+            tst = 0;                                                          \
+        } else {                                                              \
+            ++pc;                                                             \
+            tst = static_cast<std::uint16_t>(_opcode << 3);                   \
+        }                                                                     \
+        addr = pc;                                                            \
         TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
         break;                                                                \
     }
@@ -496,16 +504,16 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 1: {                                               \
-        auto _take_int = int_cycle <= current;                                \
-        auto _opcode   = config.read_opcode(addr);                            \
-        pc            += !_take_int;                                          \
-        tst            = static_cast<std::uint16_t>(                          \
-                            !_take_int * (_opcode << 3));                     \
-        addr           = pc;                                                  \
-        if (!_take_int) {                                                     \
+        auto _opcode = config.read_opcode(addr);                              \
+        if (int_cycle <= current) {                                           \
+            tst = 0;                                                          \
+        } else {                                                              \
+            ++pc;                                                             \
+            tst = static_cast<std::uint16_t>(_opcode << 3);                   \
             r.p = static_cast<std::uint8_t>(r.p | flag::I);                   \
         }                                                                     \
-        int_cycle      = recompute_int_cycle();                               \
+        addr      = pc;                                                       \
+        int_cycle = recompute_int_cycle();                                    \
         TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
         break;                                                                \
     }
@@ -517,16 +525,16 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 1: {                                               \
-        auto _take_int = int_cycle <= current;                                \
-        auto _opcode   = config.read_opcode(addr);                            \
-        pc            += !_take_int;                                          \
-        tst            = static_cast<std::uint16_t>(                          \
-                            !_take_int * (_opcode << 3));                     \
-        addr           = pc;                                                  \
-        if (!_take_int) {                                                     \
+        auto _opcode = config.read_opcode(addr);                              \
+        if (int_cycle <= current) {                                           \
+            tst = 0;                                                          \
+        } else {                                                              \
+            ++pc;                                                             \
+            tst = static_cast<std::uint16_t>(_opcode << 3);                   \
             r.p = static_cast<std::uint8_t>(r.p & ~flag::I);                  \
         }                                                                     \
-        int_cycle      = recompute_int_cycle();                               \
+        addr      = pc;                                                       \
+        int_cycle = recompute_int_cycle();                                    \
         TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
         break;                                                                \
     }
@@ -1455,19 +1463,21 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
-        auto _take_int = int_cycle <= current;                                \
-        auto _opcode   = config.read_opcode(addr);                            \
-        pc            += !_take_int;                                          \
-        tst            = static_cast<std::uint16_t>(                          \
-                            !_take_int * (_opcode << 3));                     \
-        addr           = pc;                                                  \
         auto _pulled_p = static_cast<std::uint8_t>(                           \
                             (base & ~flag::B) | flag::U);                     \
-        r.p = _take_int                                                       \
-            ? static_cast<std::uint8_t>(                                      \
-                  (_pulled_p & ~flag::I) | (r.p & flag::I))                   \
-            : _pulled_p;                                                      \
-        int_cycle      = recompute_int_cycle();                               \
+        auto _opcode   = config.read_opcode(addr);                            \
+        if (int_cycle <= current) {                                           \
+            tst = 0;                                                          \
+            /* Commit non-I bits; preserve pre-PLP I for BRK to push. */     \
+            r.p = static_cast<std::uint8_t>(                                  \
+                (_pulled_p & ~flag::I) | (r.p & flag::I));                    \
+        } else {                                                              \
+            ++pc;                                                             \
+            tst = static_cast<std::uint16_t>(_opcode << 3);                   \
+            r.p = _pulled_p;                                                  \
+        }                                                                     \
+        addr      = pc;                                                       \
+        int_cycle = recompute_int_cycle();                                    \
         TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
         break;                                                                \
     }
@@ -1640,12 +1650,14 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
                so the taken-no-cross path stays branch-free, paying the       \
                eaten-IRQ rule only at this case label. */                     \
     case ((OPCODE) << 3) | 4: {                                               \
-            auto _take_int = int_cycle + 2 <= current;                        \
-            auto _opcode   = config.read_opcode(addr);                        \
-            pc            += !_take_int;                                      \
-            tst            = static_cast<std::uint16_t>(                      \
-                                !_take_int * (_opcode << 3));                 \
-            addr           = pc;                                              \
+            auto _opcode = config.read_opcode(addr);                          \
+            if (int_cycle + 2 <= current) {                                   \
+                tst = 0;                                                      \
+            } else {                                                          \
+                ++pc;                                                         \
+                tst = static_cast<std::uint16_t>(_opcode << 3);               \
+            }                                                                 \
+            addr = pc;                                                        \
             TAWNY_STEP_TAIL(access_cost(addr), tst);                          \
             break;                                                            \
         }                                                                     \
