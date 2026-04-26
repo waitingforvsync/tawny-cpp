@@ -228,3 +228,299 @@ TEST_CASE("M6502: JMP-to-self trap stops the timeslice via access_cost stop") {
     CHECK(cpu.pending_addr == 0x0400);
     CHECK(cpu.tstate == ((0x4C << 3) | 2));
 }
+
+// =============================================================================
+// IRQ / NMI tests
+// =============================================================================
+
+namespace {
+
+// Test config that lets the test script IRQ assertion / NMI edge cycles.
+// Behaviour for non-interrupt accesses matches DormannCpuConfig (incl. JMP-to-
+// self trap detection in access_cost_opcode), which lets us terminate via the
+// existing trap mechanism.
+struct ProgrammableInterruptConfig : tawny::dormann::DormannCpuConfig {
+    tawny::Cycle irq_since{tawny::interrupt_never};
+    tawny::Cycle nmi_at{tawny::interrupt_never};
+    bool         nmi_consumed{false};
+
+    auto irq_asserted_since() const -> tawny::Cycle { return irq_since; }
+    auto nmi_edge_at()        const -> tawny::Cycle
+    {
+        return nmi_consumed ? tawny::interrupt_never : nmi_at;
+    }
+    auto consume_nmi() -> void { nmi_consumed = true; }
+};
+
+static_assert(tawny::M6502Config<ProgrammableInterruptConfig>);
+
+using IrqCpu = tawny::M6502<ProgrammableInterruptConfig>;
+
+// Build a CPU starting at $0400 with set_pc (skipping reset), I=0, S=0xFD,
+// and standard interrupt vectors:
+//   $FFFA/B → $0600 (NMI handler)
+//   $FFFE/F → $0500 (IRQ / software-BRK handler)
+// Both handlers default to JMP * so the trap detector catches handler entry.
+// Caller supplies the body at $0400.
+auto make_irq_cpu() -> IrqCpu
+{
+    ProgrammableInterruptConfig cfg{};
+    // Vectors.
+    cfg.mem[0xFFFE] = 0x00; cfg.mem[0xFFFF] = 0x05;
+    cfg.mem[0xFFFA] = 0x00; cfg.mem[0xFFFB] = 0x06;
+    // Handlers: JMP * (3-byte trap).
+    cfg.mem[0x0500] = 0x4C; cfg.mem[0x0501] = 0x00; cfg.mem[0x0502] = 0x05;
+    cfg.mem[0x0600] = 0x4C; cfg.mem[0x0601] = 0x00; cfg.mem[0x0602] = 0x06;
+
+    IrqCpu cpu{std::move(cfg)};
+    cpu.set_pc(0x0400);
+    cpu.s = 0xFD;
+    cpu.p = tawny::flag::U;        // I = 0
+    return cpu;
+}
+
+constexpr auto kIrqVec = std::uint16_t{0x0500};
+constexpr auto kNmiVec = std::uint16_t{0x0600};
+
+}  // namespace
+
+// 1. IRQ with I clear runs handler.
+TEST_CASE("M6502: IRQ with I=0 enters handler at $FFFE/F") {
+    auto cpu = make_irq_cpu();
+    // Program: NOP NOP NOP NOP JMP * — the IRQ should preempt before the trap.
+    cpu.config.mem[0x0400] = 0xEA;
+    cpu.config.mem[0x0401] = 0xEA;
+    cpu.config.mem[0x0402] = 0xEA;
+    cpu.config.mem[0x0403] = 0xEA;
+    cpu.config.mem[0x0404] = 0x4C;
+    cpu.config.mem[0x0405] = 0x04;
+    cpu.config.mem[0x0406] = 0x04;
+    // IRQ asserted from cycle 0 — should fire at the first instruction boundary.
+    cpu.config.irq_since = 0;
+
+    cpu.run_until(1ull << 30);
+
+    CHECK(cpu.pc == kIrqVec);                         // handler trapping
+    CHECK((cpu.p & tawny::flag::I) == tawny::flag::I); // I set in handler
+    CHECK(cpu.s == 0xFA);                              // 3 pushes
+}
+
+// 2. IRQ with I set is masked.
+TEST_CASE("M6502: IRQ with I=1 is masked, handler never entered") {
+    auto cpu = make_irq_cpu();
+    cpu.p = tawny::flag::U | tawny::flag::I;
+    cpu.config.mem[0x0400] = 0xEA;                     // NOP
+    cpu.config.mem[0x0401] = 0x4C;                     // JMP $0401
+    cpu.config.mem[0x0402] = 0x01;
+    cpu.config.mem[0x0403] = 0x04;
+    cpu.config.irq_since = 0;
+
+    cpu.run_until(1ull << 30);
+
+    CHECK(cpu.pc == 0x0401);                           // trap on JMP $0401
+    CHECK(cpu.s == 0xFD);                              // no pushes
+}
+
+// 3. SEI quirk — IRQ asserted before SEI is still serviced after SEI.
+TEST_CASE("M6502: SEI quirk — pending IRQ runs handler after SEI") {
+    auto cpu = make_irq_cpu();
+    // SEI ($78) NOP NOP JMP *.
+    cpu.config.mem[0x0400] = 0x78;
+    cpu.config.mem[0x0401] = 0xEA;
+    cpu.config.mem[0x0402] = 0xEA;
+    cpu.config.mem[0x0403] = 0x4C;
+    cpu.config.mem[0x0404] = 0x03;
+    cpu.config.mem[0x0405] = 0x04;
+    cpu.config.irq_since = 0;
+
+    cpu.run_until(1ull << 30);
+
+    CHECK(cpu.pc == kIrqVec);
+    // Pre-SEI I was 0 — pushed P (at $01FB after PCH/PCL) should reflect that.
+    CHECK((cpu.config.mem[0x01FB] & tawny::flag::I) == 0);
+}
+
+// 4. CLI delay — IRQ pending under I=1 fires only after the instruction *after* CLI.
+TEST_CASE("M6502: CLI delay — IRQ fires after the instruction following CLI") {
+    auto cpu = make_irq_cpu();
+    cpu.p = tawny::flag::U | tawny::flag::I;
+    // CLI ($58) NOP_a NOP_b JMP *
+    // Per NESdev: CLI's boundary poll uses pre-CLI I (=1), so no IRQ at CLI.
+    // The next instruction (NOP_a)'s boundary polls with I=0 and IRQ fires.
+    // So handler enters AFTER NOP_a, BEFORE NOP_b.
+    cpu.config.mem[0x0400] = 0x58;
+    cpu.config.mem[0x0401] = 0xEA;
+    cpu.config.mem[0x0402] = 0xEA;
+    cpu.config.mem[0x0403] = 0x4C;
+    cpu.config.mem[0x0404] = 0x03;
+    cpu.config.mem[0x0405] = 0x04;
+    cpu.config.irq_since = 0;
+
+    cpu.run_until(1ull << 30);
+
+    CHECK(cpu.pc == kIrqVec);
+    // Return address pushed should be 0x0402 (after NOP_a, NOP_b not yet run).
+    CHECK(cpu.config.mem[0x01FD] == 0x04);             // PCH
+    CHECK(cpu.config.mem[0x01FC] == 0x02);             // PCL
+}
+
+// 5. PLP delay — pulling I=0 with pending IRQ behaves like CLI.
+TEST_CASE("M6502: PLP delay — IRQ fires after instruction following PLP") {
+    auto cpu = make_irq_cpu();
+    cpu.p = tawny::flag::U | tawny::flag::I;
+    cpu.s = 0xFC;
+    // Pre-stage: stack-top = P with I=0.
+    cpu.config.mem[0x01FD] = tawny::flag::U;
+    // PLP ($28) NOP NOP JMP *
+    cpu.config.mem[0x0400] = 0x28;
+    cpu.config.mem[0x0401] = 0xEA;
+    cpu.config.mem[0x0402] = 0xEA;
+    cpu.config.mem[0x0403] = 0x4C;
+    cpu.config.mem[0x0404] = 0x03;
+    cpu.config.mem[0x0405] = 0x04;
+    cpu.config.irq_since = 0;
+
+    cpu.run_until(1ull << 30);
+
+    CHECK(cpu.pc == kIrqVec);
+    // Handler enters after the NOP that follows PLP (PLP was 4 cycles, NOP 2):
+    // expected return PC = $0402 (NOP at $0401 ran, NOP at $0402 not yet).
+    // PLP raised s to 0xFD, then IRQ pushed PCH/PCL/P at 0xFD/0xFC/0xFB.
+    CHECK(cpu.config.mem[0x01FD] == 0x04);             // PCH
+    CHECK(cpu.config.mem[0x01FC] == 0x02);             // PCL
+}
+
+// 6. RTI immediate — pulling I=0 enables IRQ on the very next instruction.
+TEST_CASE("M6502: RTI immediate — IRQ taken on the next instruction") {
+    auto cpu = make_irq_cpu();
+    cpu.p = tawny::flag::U | tawny::flag::I;
+    cpu.s = 0xFA;
+    // Stack contents that RTI will pull, top to bottom:
+    //   [s+1] P = U (I=0)
+    //   [s+2] PCL = 0x00
+    //   [s+3] PCH = 0x04
+    cpu.config.mem[0x01FB] = tawny::flag::U;           // P
+    cpu.config.mem[0x01FC] = 0x01;                     // PCL → return to $0401
+    cpu.config.mem[0x01FD] = 0x04;                     // PCH
+    cpu.config.mem[0x0400] = 0x40;                     // RTI (executed if PC=$0400)
+    // Continuation at $0401: NOP NOP JMP *
+    cpu.config.mem[0x0401] = 0xEA;
+    cpu.config.mem[0x0402] = 0xEA;
+    cpu.config.mem[0x0403] = 0x4C;
+    cpu.config.mem[0x0404] = 0x03;
+    cpu.config.mem[0x0405] = 0x04;
+    cpu.config.irq_since = 0;
+
+    cpu.run_until(1ull << 30);
+
+    CHECK(cpu.pc == kIrqVec);
+    // RTI returned to $0401. Per NESdev RTI's I-effect is immediate, so the
+    // boundary poll at end of RTI sees I=0 and IRQ fires *before* the NOP at
+    // $0401 runs. Pushed return PC = $0401.
+    CHECK(cpu.config.mem[0x01FD] == 0x04);             // PCH
+    CHECK(cpu.config.mem[0x01FC] == 0x01);             // PCL
+}
+
+// 9. NMI fires regardless of I.
+TEST_CASE("M6502: NMI ignores I flag, enters NMI handler") {
+    auto cpu = make_irq_cpu();
+    cpu.p = tawny::flag::U | tawny::flag::I;
+    cpu.config.mem[0x0400] = 0xEA;
+    cpu.config.mem[0x0401] = 0xEA;
+    cpu.config.mem[0x0402] = 0x4C;
+    cpu.config.mem[0x0403] = 0x02;
+    cpu.config.mem[0x0404] = 0x04;
+    cpu.config.nmi_at = 0;
+
+    cpu.run_until(1ull << 30);
+
+    CHECK(cpu.pc == kNmiVec);
+    CHECK(cpu.config.nmi_consumed);
+}
+
+// 10. NMI > IRQ priority.
+TEST_CASE("M6502: NMI takes priority over simultaneous IRQ") {
+    auto cpu = make_irq_cpu();
+    cpu.config.mem[0x0400] = 0xEA;
+    cpu.config.mem[0x0401] = 0xEA;
+    cpu.config.mem[0x0402] = 0x4C;
+    cpu.config.mem[0x0403] = 0x02;
+    cpu.config.mem[0x0404] = 0x04;
+    cpu.config.irq_since = 0;
+    cpu.config.nmi_at    = 0;
+
+    cpu.run_until(1ull << 30);
+
+    CHECK(cpu.pc == kNmiVec);
+}
+
+// 11. NMI hijack — software BRK in flight, NMI fires during BRK ticks 1-3.
+TEST_CASE("M6502: NMI hijacks an in-flight software BRK") {
+    auto cpu = make_irq_cpu();
+    // BRK ($00 + signature) JMP * (post-BRK).
+    cpu.config.mem[0x0400] = 0x00;
+    cpu.config.mem[0x0401] = 0xFF;                     // signature byte
+    cpu.config.mem[0x0402] = 0x4C;
+    cpu.config.mem[0x0403] = 0x02;
+    cpu.config.mem[0x0404] = 0x04;
+    // Schedule NMI to fire at cycle 2 (during BRK step 1 or 2). BRK starts at
+    // cycle 1 (FETCH for BRK opcode), so cycle 2-3 is in the BRK sequence.
+    cpu.config.nmi_at = 2;
+
+    cpu.run_until(1ull << 30);
+
+    // Hijack landed: vector fetched is NMI's, handler is at $0600.
+    CHECK(cpu.pc == kNmiVec);
+    // B flag still pushed as 1 (signature of software BRK). P pushed at
+    // s=0xFB (after PCH at 0xFD and PCL at 0xFC).
+    CHECK((cpu.config.mem[0x01FB] & tawny::flag::B) == tawny::flag::B);
+}
+
+// 7. Taken-no-cross branch eats the IRQ (deferred to post-branch instruction).
+TEST_CASE("M6502: taken-no-cross 3-cycle branch eats interrupt") {
+    auto cpu = make_irq_cpu();
+    // BNE $0405 (taken because Z=0 from initial p), no page cross.
+    // After branch: NOP, JMP *.
+    cpu.config.mem[0x0400] = 0xD0;                     // BNE
+    cpu.config.mem[0x0401] = 0x03;                     // offset +3 → $0405
+    // pad
+    cpu.config.mem[0x0405] = 0xEA;                     // NOP at branch target
+    cpu.config.mem[0x0406] = 0x4C;                     // JMP *
+    cpu.config.mem[0x0407] = 0x06;
+    cpu.config.mem[0x0408] = 0x04;
+    // IRQ asserted at cycle 1 — within the branch's operand-fetch cycle.
+    // Per NESdev, the eaten-poll rule says this is NOT serviced at the branch
+    // boundary; it's serviced at the boundary of the post-branch NOP.
+    cpu.config.irq_since = 1;
+
+    cpu.run_until(1ull << 30);
+
+    CHECK(cpu.pc == kIrqVec);
+    // Pushed return PC should be $0406 — the NOP ran before IRQ took effect.
+    CHECK(cpu.config.mem[0x01FD] == 0x04);             // PCH
+    CHECK(cpu.config.mem[0x01FC] == 0x06);             // PCL
+}
+
+// 12. Interrupt sequences don't poll — handler's first instruction always runs.
+TEST_CASE("M6502: handler's first instruction always runs (no immediate re-entry)") {
+    auto cpu = make_irq_cpu();
+    cpu.config.mem[0x0400] = 0xEA;
+    cpu.config.mem[0x0401] = 0x4C;
+    cpu.config.mem[0x0402] = 0x01;
+    cpu.config.mem[0x0403] = 0x04;
+    // Replace the IRQ handler with: CLI; JMP *. Even with IRQ continuously
+    // asserted (level-triggered) and CLI re-enabling I, the handler's first
+    // instruction (CLI) must always run before another IRQ can preempt.
+    cpu.config.mem[0x0500] = 0x58;                     // CLI
+    cpu.config.mem[0x0501] = 0x4C;                     // JMP $0501
+    cpu.config.mem[0x0502] = 0x01;
+    cpu.config.mem[0x0503] = 0x05;
+    cpu.config.irq_since = 0;
+
+    cpu.run_until(1ull << 30);
+
+    // Handler entered, ran CLI, then trapped at JMP $0501. We did NOT
+    // immediately re-enter the handler.
+    CHECK(cpu.pc == 0x0501);
+    CHECK(cpu.s == 0xFA);                              // exactly one entry's pushes
+}

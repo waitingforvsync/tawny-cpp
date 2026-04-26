@@ -51,6 +51,13 @@ struct DormannCpuConfig {
     auto access_cost_stack(std::uint8_t) const -> AccessCost    { return {1, false}; }
     auto access_cost_vector(std::uint16_t) const -> AccessCost  { return {1, false}; }
     auto access_cost(std::uint16_t) const -> AccessCost         { return {1, false}; }
+
+    // Dormann's functional + decimal tests don't fire interrupts. The
+    // interrupt test does, but it goes through a derived config that
+    // overrides these.
+    auto irq_asserted_since() const -> Cycle { return interrupt_never; }
+    auto nmi_edge_at()        const -> Cycle { return interrupt_never; }
+    auto consume_nmi()              -> void  {}
 };
 
 }  // namespace tawny::dormann

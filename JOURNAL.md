@@ -261,3 +261,41 @@ Captured as constants in `interrupt_test_bin.h` so we don't lose track before th
 - Read semantics: returns the last latched value.
 - `feedback_write_mask = 0x7F` — bit 7 is filtered on write (used as a diag-stop in the original hardware variants; we drop it).
 - The test never touches DDR (`I_ddr = 0` in the source) and assumes `I_drive = 1` (open-collector).
+
+## 2026-04-26 — IRQ / NMI core: single-`int_cycle` design, FETCH variants for the quirks
+
+### What we did
+Added cycle-accurate IRQ/NMI handling to the M6502 core. The hot path stays barely changed — the common `TAWNY_FETCH_OPCODE_CASE` is a six-line branch-free body — and all peripheral interrupt state lives in the `M6502Config`. The four 6502 quirks NESdev calls out (SEI/CLI/PLP delayed-I, RTI immediate-I, taken-no-cross branch "eats" the IRQ, NMI hijack of an in-flight BRK) are each handled by routing the specific instruction's last micro-op through a dedicated FETCH variant rather than carrying per-CPU latches.
+
+- **`M6502Config` concept** gained three methods. `irq_asserted_since() -> Cycle` returns the earliest cycle IRQ has been continuously asserted (or sentinel `interrupt_never`). `nmi_edge_at() -> Cycle` returns the next NMI falling-edge cycle. `consume_nmi() -> void` is called by the CPU when it begins servicing the latched edge.
+- **No new fields on `M6502`.** `sample_interrupts()`/`irq()`/`nmi()` stubs are gone. `brk_flags` stays — it's a transient indicator BRK micro-ops use for B-flag and vector selection, set at step 0 from the config.
+- **`run_until` locals.** Three new locals at the top: `irq_take = config.irq_asserted_since() + 2`, `nmi_take = config.nmi_edge_at() + 2`, `int_cycle = (r.p & I) ? nmi_take : min(irq, nmi)`. A `recompute_int_cycle` capture is shared between the variants. `int_cycle` is recomputed only by SEI/CLI/PLP/RTI's specific FETCHes and forced to `interrupt_never` inside BRK.
+- **The five FETCH variants** (in `m6502.h`):
+  - `TAWNY_FETCH_OPCODE_CASE` (default, 240+ opcodes): `take_int = int_cycle <= current`; branchless `pc += !take_int; tst = !take_int * (opcode << 3)`.
+  - `TAWNY_FETCH_OPCODE_CASE_DEFER_I` (BRK's handler-first FETCH): same as default but recomputes `int_cycle` from `r.p` afterward.
+  - `TAWNY_FETCH_OPCODE_CASE_IMMEDIATE_I` (RTI): recomputes `int_cycle` *before* the take_int test, matching RTI's "I commits before the poll" semantics.
+  - `TAWNY_FETCH_OPCODE_CASE_BRANCH_NOCROSS` (taken-no-cross 3-cycle branches): `take_int = int_cycle + 2 <= current`; the +2 captures NESdev's "branches poll at end of cycle 0, not at penultimate" rule.
+  - The default variant is implicitly used by non-taken and taken-cross branches (the existing fall-through dispatch already routed them through it).
+- **SEI / CLI / PLP get dedicated macros** (`TAWNY_SEI`, `TAWNY_CLI`, `TAWNY_PLP`) that commit the new I bit *only on the non-take_int path*. If take_int fires, `r.p` keeps pre-instruction I so BRK's step-3 push pushes the correct P (then BRK sets I=1 itself). PLP additionally stashes the pulled byte in `base` at step 2 and commits the non-I bits unconditionally + the I bit conditionally at step 3 = FETCH.
+- **`TAWNY_BRK` step 0** queries `int_cycle <= current` and `nmi_take <= current` to set `brk_flags = Nmi/Irq/None`; only software BRK advances `pc` past the signature byte.
+- **`TAWNY_BRK` step 3** re-checks NMI for the hijack quirk (NMI fired during BRK ticks 0-3 redirects an in-flight IRQ/SW-BRK to `$FFFA/B` with the original B flag still pushed), then sets `int_cycle = interrupt_never` so the handler's first FETCH cannot poll regardless of what NMI did during BRK.
+- **Branch routing.** `TAWNY_REL_BRANCH` was already three-way (not-taken / taken-no-cross / taken-cross) via case labels nested inside the if-chain. Added a fourth case label for the no-cross FETCH variant inside the taken-no-cross branch; not-taken and taken-cross still fall through to the default FETCH at step 3.
+
+### What we tried and walked away from
+- **`pre_instruction_p` snapshot at every FETCH** (the design we'd previously planned). Worked, but added per-FETCH I-flag logic to the hot path. The user pushed back: they wanted the common FETCH "barely more complicated", which led to the per-instruction FETCH-variant design landed here. SEI/CLI/PLP get the cost of the `recompute_int_cycle` call and a conditional I-commit; non-I-modifying instructions pay nothing extra.
+- **Moving `brk_flags` to the Config**. Considered but rejected — the only thing it tracks the config doesn't already know is "was this software BRK?", and that's purely CPU-side state. Moving it out adds three setter/getter methods for a 1-byte indicator. Kept on `M6502`.
+
+### Design decisions
+- **One `int_cycle` instead of separate `irq_take` / `nmi_take` predicates per FETCH.** The compare reduces to `int_cycle <= current` everywhere; the I-flag-aware threshold collapses into a single value, mutated by exactly five sites (run_until top, SEI/CLI's FETCH, PLP's FETCH, RTI's FETCH, BRK step 3). Hot non-I-modifying instructions never touch it.
+- **Conditional I-commit in SEI/CLI/PLP** rather than rolling back at BRK entry. Putting the conditional in the FETCH macro means BRK's step-3 push is unchanged for *every* entry path (Reset/IRQ/NMI/SW-BRK/SEI-quirk/CLI-delay/PLP-delay) — it just pushes whatever `r.p` is. Cleaner than a "save pre-instruction P somewhere" scheme.
+- **`int_cycle = interrupt_never` at BRK step 3** for the "interrupt sequences don't poll" rule. The handler's first FETCH (BRK step 6 = DEFER_I) reads the sentinel via the take_int test, never fires, then recomputes `int_cycle` from the now-I=1 r.p — so the handler's *next* FETCH onwards correctly polls for any NMI that fired in the post-hijack-window cycles.
+- **Branch quirk via formula shift, not state.** `int_cycle + 2 <= current` (vs the default `int_cycle <= current`) implements the eaten-IRQ rule directly from the cycle accounting, no `branch_irq_latched` field. The taken-no-cross path of REL_BRANCH falls through to a fourth case label inside the if-chain, keeping fall-through dispatch intact.
+- **`InterruptTestConfig` for the unit tests.** A trivial derived class of `DormannCpuConfig` with three settable fields (`irq_since`, `nmi_at`, `nmi_consumed`) and the three concept methods. Twelve TEST_CASEs cover the IRQ basic + masked + SEI quirk + CLI delay + PLP delay + RTI immediate + NMI vs IRQ priority + NMI hijack + taken-no-cross branch eats + sequences-don't-poll.
+
+### Verification
+- `./build/tawny --test` — 27 cases passing, 1 skipped (Dormann interrupt test, see "what's deferred"), 101 assertions green.
+- Dormann functional test: 96 249 816 cycles per run, unchanged. Decimal test passes.
+- Effective clock 800-1100 MHz median (was 1090-1200 MHz pre-implementation). The drop is the cost of the take_int compare + branchless mux in the common FETCH; acceptable for now and the regression budget the user signed off on.
+
+### What's deferred
+- **Dormann interrupt test wiring** (task #33). The test pokes `$BFFC` mid-run_until to assert IRQ/NMI; the deferred-sync model samples interrupt state only at `run_until` boundaries. Three options on the table: stop=true on `$BFFC` writes, a re-query hook in FETCH, or a config-side cycle counter — punting until we discuss the right shape.

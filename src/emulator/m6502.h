@@ -1,13 +1,20 @@
 #pragma once
 
+#include <algorithm>
 #include <concepts>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 #include <utility>
 
 namespace tawny {
 
 using Cycle = std::uint64_t;
+
+// Sentinel for "no interrupt scheduled". Picked far above any plausible cycle
+// count but with headroom for the +2 latency add the CPU does internally, so
+// configs can return this without arithmetic overflow.
+inline constexpr Cycle interrupt_never = std::numeric_limits<Cycle>::max() / 2;
 
 // Returned by every `access_cost_*` method on the Config.
 //
@@ -70,6 +77,25 @@ concept M6502Config = requires(T &cfg,
     { cfg.access_cost_stack(zp)    } -> std::same_as<AccessCost>;
     { cfg.access_cost_vector(addr) } -> std::same_as<AccessCost>;
     { cfg.access_cost(addr)        } -> std::same_as<AccessCost>;
+
+    // Interrupt sources. Both methods are queried once at the start of every
+    // run_until call; the CPU adds the 2-cycle hardware detection latency and
+    // caches the result for the duration. Implementations aggregate all
+    // peripheral IRQ/NMI sources.
+    //
+    // irq_asserted_since: smallest cycle from which IRQ has been continuously
+    //   asserted, or `interrupt_never` if not currently asserted. The CPU
+    //   gates this via the I flag.
+    //
+    // nmi_edge_at: cycle of the next NMI falling edge in the run_until window,
+    //   or `interrupt_never` if none. Edge-triggered: only fires once per
+    //   edge. The CPU calls consume_nmi() when it begins servicing the edge.
+    //
+    // consume_nmi: marks the latched NMI edge as serviced. Subsequent calls to
+    //   nmi_edge_at() return `interrupt_never` until the next edge.
+    { cfg.irq_asserted_since()     } -> std::same_as<Cycle>;
+    { cfg.nmi_edge_at()            } -> std::same_as<Cycle>;
+    { cfg.consume_nmi()            } -> std::same_as<void>;
 };
 
 // Status-register flag bits (P).
@@ -372,12 +398,76 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 // opcode byte (via read_opcode for the sync-read semantics), shifts it into a
 // step-0 tstate for the new instruction, sets up the operand-fetch address,
 // and breaks out so the while loop re-enters the switch at the new tstate.
+//
+// Interrupt poll: int_cycle (a run_until local) carries the cycle at or after
+// which an interrupt should be taken, already gated by the I flag (set to
+// nmi_take when I=1, min(irq_take, nmi_take) when I=0). When take_int fires,
+// pc is left unchanged, the opcode-fetch byte is discarded, and tst is forced
+// to 0 = BRK step 0 — BRK then queries the config to deduce IRQ vs NMI vs
+// software BRK and continues from there. Common path is branchless.
 
 #define TAWNY_FETCH_OPCODE_CASE(OPCODE, STEP)                                 \
     case ((OPCODE) << 3) | (STEP): {                                          \
-        ++pc;                                                                 \
-        tst  = static_cast<std::uint16_t>(config.read_opcode(addr) << 3);     \
-        addr = pc;                                                            \
+        auto _take_int = int_cycle <= current;                                \
+        auto _opcode   = config.read_opcode(addr);                            \
+        pc            += !_take_int;                                          \
+        tst            = static_cast<std::uint16_t>(                          \
+                            !_take_int * (_opcode << 3));                     \
+        addr           = pc;                                                  \
+        TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
+        break;                                                                \
+    }
+
+// FETCH_OPCODE_CASE_DEFER_I — for SEI / CLI / PLP, whose I-flag change is
+// "delayed" per NESdev: the boundary poll uses pre-instruction I, and only
+// the *next* instruction's poll sees the new I. Same body as default plus
+// an int_cycle update *after* the take_int test.
+
+#define TAWNY_FETCH_OPCODE_CASE_DEFER_I(OPCODE, STEP)                         \
+    case ((OPCODE) << 3) | (STEP): {                                          \
+        auto _take_int = int_cycle <= current;                                \
+        auto _opcode   = config.read_opcode(addr);                            \
+        pc            += !_take_int;                                          \
+        tst            = static_cast<std::uint16_t>(                          \
+                            !_take_int * (_opcode << 3));                     \
+        addr           = pc;                                                  \
+        int_cycle      = recompute_int_cycle();                               \
+        TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
+        break;                                                                \
+    }
+
+// FETCH_OPCODE_CASE_IMMEDIATE_I — for RTI, whose I-flag change is committed
+// *before* the boundary poll per NESdev. int_cycle is recomputed up front so
+// the take_int test sees post-RTI I.
+
+#define TAWNY_FETCH_OPCODE_CASE_IMMEDIATE_I(OPCODE, STEP)                     \
+    case ((OPCODE) << 3) | (STEP): {                                          \
+        int_cycle      = recompute_int_cycle();                               \
+        auto _take_int = int_cycle <= current;                                \
+        auto _opcode   = config.read_opcode(addr);                            \
+        pc            += !_take_int;                                          \
+        tst            = static_cast<std::uint16_t>(                          \
+                            !_take_int * (_opcode << 3));                     \
+        addr           = pc;                                                  \
+        TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
+        break;                                                                \
+    }
+
+// FETCH_OPCODE_CASE_BRANCH_NOCROSS — for the taken-no-cross path of
+// conditional branches. Same body as default but the take_int threshold is
+// shifted two cycles, matching NESdev's "branches poll at end of cycle 0,
+// not at penultimate" rule for taken-no-cross 3-cycle branches: an IRQ that
+// becomes detectable during cycles 1 or 2 of such a branch is *not*
+// serviced at the branch boundary; it's deferred to the next instruction.
+
+#define TAWNY_FETCH_OPCODE_CASE_BRANCH_NOCROSS(OPCODE, STEP)                  \
+    case ((OPCODE) << 3) | (STEP): {                                          \
+        auto _take_int = int_cycle + 2 <= current;                            \
+        auto _opcode   = config.read_opcode(addr);                            \
+        pc            += !_take_int;                                          \
+        tst            = static_cast<std::uint16_t>(                          \
+                            !_take_int * (_opcode << 3));                     \
+        addr           = pc;                                                  \
         TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
         break;                                                                \
     }
@@ -393,6 +483,53 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 1)
+
+// SEI / CLI — 2 cycles, with NESdev's "delay I-effect" rule: the boundary
+// poll uses pre-instruction I, and the I commit happens *only* on the
+// non-take_int path. If take_int fires, r.p keeps pre-instruction I so BRK's
+// step 3 pushes the correct P; BRK then sets I=1 itself.
+
+#define TAWNY_SEI(OPCODE)                                                     \
+    case ((OPCODE) << 3) | 0: {                                               \
+        (void)config.read(addr);                                              \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        auto _take_int = int_cycle <= current;                                \
+        auto _opcode   = config.read_opcode(addr);                            \
+        pc            += !_take_int;                                          \
+        tst            = static_cast<std::uint16_t>(                          \
+                            !_take_int * (_opcode << 3));                     \
+        addr           = pc;                                                  \
+        if (!_take_int) {                                                     \
+            r.p = static_cast<std::uint8_t>(r.p | flag::I);                   \
+        }                                                                     \
+        int_cycle      = recompute_int_cycle();                               \
+        TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
+        break;                                                                \
+    }
+
+#define TAWNY_CLI(OPCODE)                                                     \
+    case ((OPCODE) << 3) | 0: {                                               \
+        (void)config.read(addr);                                              \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        auto _take_int = int_cycle <= current;                                \
+        auto _opcode   = config.read_opcode(addr);                            \
+        pc            += !_take_int;                                          \
+        tst            = static_cast<std::uint16_t>(                          \
+                            !_take_int * (_opcode << 3));                     \
+        addr           = pc;                                                  \
+        if (!_take_int) {                                                     \
+            r.p = static_cast<std::uint8_t>(r.p & ~flag::I);                  \
+        }                                                                     \
+        int_cycle      = recompute_int_cycle();                               \
+        TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
+        break;                                                                \
+    }
 
 // IMM_READ(OPCODE, OP_CLASS) — 2 cycles. Step 0 reads the immediate byte and
 // applies the op; pc advances past it.
@@ -1254,7 +1391,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
     }                                                                         \
     [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
+    TAWNY_FETCH_OPCODE_CASE_IMMEDIATE_I(OPCODE, 5)
 
 // PHA / PHP — 3 cycles. Dummy operand read, push OP_CLASS::value(cpu),
 // fetch_opcode.
@@ -1293,6 +1430,48 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
 
+// PLP — 4 cycles. Per NESdev, PLP delays the *I* bit's commit until after
+// the boundary poll (other bits are committed at step 2 along with the
+// pull). Implementation: step 2 stashes the full pulled byte in `base`; the
+// FETCH at step 3 commits all bits including I if take_int didn't fire,
+// otherwise commits all bits *except* I (preserving pre-PLP I for BRK's
+// push). BRK itself then sets I=1, so the post-BRK r.p is correct.
+
+#define TAWNY_PLP(OPCODE)                                                     \
+    case ((OPCODE) << 3) | 0: {                                               \
+        (void)config.read(addr);                                              \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 1: {                                               \
+        (void)config.read_stack(r.s);                                         \
+        ++r.s;                                                                \
+        TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                                \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 2: {                                               \
+        base = config.read_stack(r.s);                                        \
+        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                         \
+    }                                                                         \
+    [[fallthrough]];                                                          \
+    case ((OPCODE) << 3) | 3: {                                               \
+        auto _take_int = int_cycle <= current;                                \
+        auto _opcode   = config.read_opcode(addr);                            \
+        pc            += !_take_int;                                          \
+        tst            = static_cast<std::uint16_t>(                          \
+                            !_take_int * (_opcode << 3));                     \
+        addr           = pc;                                                  \
+        auto _pulled_p = static_cast<std::uint8_t>(                           \
+                            (base & ~flag::B) | flag::U);                     \
+        r.p = _take_int                                                       \
+            ? static_cast<std::uint8_t>(                                      \
+                  (_pulled_p & ~flag::I) | (r.p & flag::I))                   \
+            : _pulled_p;                                                      \
+        int_cycle      = recompute_int_cycle();                               \
+        TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
+        break;                                                                \
+    }
+
 // JAM — halts the CPU on an illegal opcode by redirecting the next phi2 back
 // to the same opcode, which the Dormann trap detection catches. Simple stub.
 #define TAWNY_JAM(OPCODE)                                                     \
@@ -1312,19 +1491,39 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 //
 // Step layout:
 //   0: discard pending read (signature byte on SW BRK, junk on reset/IRQ/NMI);
-//      SW BRK also advances pc past the signature byte.
+//      deduce IRQ vs NMI vs SW BRK from the config (unless reset is in flight)
+//      and update brk_flags. SW BRK also advances pc past the signature byte.
 //   1: push PCH (or dummy read on reset), decrement S.
 //   2: push PCL (or dummy read), decrement S.
 //   3: push P (B set only for SW BRK; or dummy read on reset), decrement S,
-//      set I, choose vector ($FFFA NMI / $FFFC Reset / $FFFE IRQ or BRK).
+//      set I. Re-check NMI for the hijack quirk; choose vector
+//      ($FFFA NMI / $FFFC Reset / $FFFE IRQ or BRK). Suppress the next FETCH's
+//      poll by setting int_cycle = interrupt_never (NESdev: interrupt
+//      sequences don't poll; the handler's first instruction always runs).
 //   4: read vector low.
 //   5: read vector high, set PC, clear brk_flags.
-//   6: opcode fetch of the handler's first instruction.
+//   6: opcode fetch of the handler's first instruction. Uses DEFER_I so
+//      int_cycle is re-derived from r.p (now I=1) for the handler's *next*
+//      instruction.
 #define TAWNY_BRK(OPCODE)                                                     \
     case ((OPCODE) << 3) | 0: {                                               \
         (void)config.read(addr);                                              \
-        if (brk_flags == BrkFlags::None) {                                    \
-            ++pc;                                                             \
+        if (brk_flags != BrkFlags::Reset) {                                   \
+            /* int_cycle <= current at FETCH means take_int fired; matching   \
+               that test here means `int_cycle < current` because current     \
+               has advanced one cycle since FETCH. */                         \
+            auto _was_take_int = int_cycle < current;                         \
+            auto _nmi_active   = nmi_take < current;                          \
+            if (_was_take_int && _nmi_active) {                               \
+                brk_flags = BrkFlags::Nmi;                                    \
+                config.consume_nmi();                                         \
+                nmi_take  = interrupt_never;                                  \
+            } else if (_was_take_int) {                                       \
+                brk_flags = BrkFlags::Irq;                                    \
+            } else {                                                          \
+                brk_flags = BrkFlags::None;                                   \
+                ++pc;                                                         \
+            }                                                                 \
         }                                                                     \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                                \
     }                                                                         \
@@ -1360,9 +1559,24 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         }                                                                     \
         --r.s;                                                                \
         r.p = static_cast<std::uint8_t>(r.p | flag::I);                       \
+        /* NMI hijack: an NMI edge that fell during ticks 0-3 of an IRQ /     \
+           software BRK redirects this BRK to the NMI vector. (B was already  \
+           pushed using the original brk_flags, matching real-hardware        \
+           behaviour.) */                                                     \
+        if (brk_flags != BrkFlags::Nmi && brk_flags != BrkFlags::Reset        \
+            && nmi_take <= current) {                                         \
+            brk_flags = BrkFlags::Nmi;                                        \
+            config.consume_nmi();                                             \
+            nmi_take  = interrupt_never;                                      \
+        }                                                                    \
         addr = (brk_flags == BrkFlags::Nmi)   ? 0xFFFAu                       \
              : (brk_flags == BrkFlags::Reset) ? 0xFFFCu                       \
              :                                  0xFFFEu;                      \
+        /* Suppress the handler's first FETCH poll: int_cycle larger than     \
+           any possible `current` value blocks take_int in the default        \
+           formula. The DEFER_I FETCH at step 6 then re-derives int_cycle     \
+           from r.p (I now set) for the handler's *next* instruction. */     \
+        int_cycle = interrupt_never;                                          \
         TAWNY_STEP_TAIL(access_cost_vector(addr), ((OPCODE) << 3) | 4);       \
     }                                                                         \
     [[fallthrough]];                                                          \
@@ -1380,23 +1594,25 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 6);                         \
     }                                                                         \
     [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 6)
+    TAWNY_FETCH_OPCODE_CASE_DEFER_I(OPCODE, 6)
 
 // REL_BRANCH(OPCODE, COND) — 2/3/4 cycles. Three outcomes:
-//   not-taken — fall straight through to step 3 (opcode fetch).
-//   taken, no page cross — one dummy read at target (step 1), then step 3.
-//   taken, page cross — dummy read at wrong page, fix pc (step 2), step 3.
-// Step-1 and step-2 case labels live inside the relevant branches of the if
-// chain in step 0, so the common paths fall through with no tst write and
-// no re-dispatch via the switch.
+//   not-taken — fall straight through to step 3 (default FETCH).
+//   taken, no page cross — dummy read at target (step 1), then step 4
+//                          (BRANCH_NOCROSS FETCH — `<` not `<=` for the
+//                          take_int test, capturing the eaten-IRQ quirk).
+//   taken, page cross     — dummy read at wrong page, fix pc (step 2), then
+//                          step 3 (default FETCH).
+// Step-1, step-2 and step-4 case labels live inside the relevant branches of
+// the if chain in step 0, so the common paths fall through with no tst write
+// and no re-dispatch via the switch.
 
 #define TAWNY_REL_BRANCH(OPCODE, COND)                                        \
     case ((OPCODE) << 3) | 0: {                                               \
         ++pc;                                                                 \
         /* _taken / _cross declared without initializers (scalars — legal     \
-           to jump past), so the step-1 / step-2 case labels below can be     \
-           reached via the switch without hitting a bypassed init. Both       \
-           are always assigned before they're read on any path. */            \
+           to jump past), so the step-1 / step-2 / step-4 case labels below   \
+           can be reached via the switch without hitting a bypassed init.    */\
         bool _taken;                                                          \
         bool _cross;                                                          \
         {                                                                     \
@@ -1419,7 +1635,20 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
             TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);          \
     case ((OPCODE) << 3) | 1:                                                 \
             (void)config.read(addr);                                          \
-            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                     \
+            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                     \
+            /* fall through to step 4 — BRANCH_NOCROSS FETCH inlined here     \
+               so the taken-no-cross path stays branch-free, paying the       \
+               eaten-IRQ rule only at this case label. */                     \
+    case ((OPCODE) << 3) | 4: {                                               \
+            auto _take_int = int_cycle + 2 <= current;                        \
+            auto _opcode   = config.read_opcode(addr);                        \
+            pc            += !_take_int;                                      \
+            tst            = static_cast<std::uint16_t>(                      \
+                                !_take_int * (_opcode << 3));                 \
+            addr           = pc;                                              \
+            TAWNY_STEP_TAIL(access_cost(addr), tst);                          \
+            break;                                                            \
+        }                                                                     \
         } else {                                                              \
             addr = pc;                                                        \
             TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);          \
@@ -1521,17 +1750,8 @@ struct M6502 {
         cycle        = config.access_cost_opcode(target).cost;
     }
 
-    // Stage 1 stub — the single place IRQ/NMI signals would be observed at
-    // the boundary of a timeslice. IRQ/NMI pipeline is a follow-up.
-    auto sample_interrupts() -> void {}
-
-    auto irq() -> void { /* TODO: interrupt pipeline */ }
-    auto nmi() -> void { /* TODO: interrupt pipeline */ }
-
     auto run_until(Cycle horizon) -> Cycle
     {
-        sample_interrupts();
-
         // Hot state is cached in stack locals for the duration of the loop
         // and written back at `exit:`. Empirically worth ~30-35% over
         // struct-field references — the compiler can't hoist the fields
@@ -1546,6 +1766,22 @@ struct M6502 {
         // Single register-file local. Ops take it by reference and mutate
         // fields in place — one aggregate, no pack/unpack at call sites.
         auto r       = detail::Registers{this->a, this->x, this->y, this->s, this->p};
+
+        // Interrupt timing snapshot — taken once at the top because peripherals
+        // don't run inside run_until in the deferred-sync model. irq_take and
+        // nmi_take are mutated only when consume_nmi() fires (NMI hijack or
+        // initial NMI dispatch). int_cycle is the I-flag-aware threshold used
+        // by FETCH_OPCODE_CASE; it's recomputed by SEI/CLI/PLP/RTI's specific
+        // FETCH variants and forced to interrupt_never inside BRK to suppress
+        // polling on the handler's first fetch.
+        auto irq_take  = config.irq_asserted_since() + 2;
+        auto nmi_take  = config.nmi_edge_at() + 2;
+        auto recompute_int_cycle = [&]() {
+            return (r.p & flag::I)
+                ? nmi_take
+                : std::min(irq_take, nmi_take);
+        };
+        auto int_cycle = recompute_int_cycle();
 
         while (current < horizon) {
             switch (tst) {
@@ -1613,12 +1849,12 @@ struct M6502 {
                 TAWNY_ZP_READ   (0xE4, detail::Cpx)          // CPX zp (freq 17)
                 TAWNY_ZP_RMW    (0x46, detail::Lsr)          // LSR zp (freq 14)
                 TAWNY_IMPLIED   (0xEA, detail::Nop)          // NOP (freq 14)
-                TAWNY_IMPLIED   (0x58, detail::Cli)          // CLI (freq 13)
+                TAWNY_CLI       (0x58)                       // CLI (freq 13)
                 TAWNY_ACC_RMW   (0x2A, detail::Rol)          // ROL A (freq 12)
-                TAWNY_IMPLIED   (0x78, detail::Sei)          // SEI (freq 12)
+                TAWNY_SEI       (0x78)                       // SEI (freq 12)
                 TAWNY_ZP_READ   (0x05, detail::Ora)          // ORA zp (freq 11)
                 TAWNY_ZP_RMW    (0x26, detail::Rol)          // ROL zp (freq 11)
-                TAWNY_PULL      (0x28, detail::Plp)          // PLP (freq 10)
+                TAWNY_PLP       (0x28)                       // PLP (freq 10)
                 TAWNY_IMPLIED   (0x9A, detail::Txs)          // TXS (freq 9)
                 TAWNY_ZP_RMW    (0x06, detail::Asl)          // ASL zp (freq 8)
                 TAWNY_ZP_READ   (0x25, detail::And)          // AND zp (freq 8)
@@ -1856,8 +2092,13 @@ struct M6502 {
 #undef TAWNY_NEXT_STACK
 #undef TAWNY_NEXT_OPCODE_FETCH
 #undef TAWNY_FETCH_OPCODE_CASE
+#undef TAWNY_FETCH_OPCODE_CASE_DEFER_I
+#undef TAWNY_FETCH_OPCODE_CASE_IMMEDIATE_I
+#undef TAWNY_FETCH_OPCODE_CASE_BRANCH_NOCROSS
 #undef TAWNY_BRK
 #undef TAWNY_IMPLIED
+#undef TAWNY_SEI
+#undef TAWNY_CLI
 #undef TAWNY_IMM_READ
 #undef TAWNY_ZP_READ
 #undef TAWNY_ZP_WRITE
@@ -1896,4 +2137,5 @@ struct M6502 {
 #undef TAWNY_RTI
 #undef TAWNY_PUSH
 #undef TAWNY_PULL
+#undef TAWNY_PLP
 #undef TAWNY_JAM
