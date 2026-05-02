@@ -308,3 +308,32 @@ The branchless overwrite TAWNY_POLL beat the branchy `if (...) brk_flags |= bit;
 ### What's still missing
 - **Dormann interrupt test wiring.** `interrupt_test_bin.h` carries the `$BFFC` MMIO contract; we need a Dormann config wrapper that latches writes to `$BFFC` and drives `is_irq()` / `is_nmi()` from the latched byte. Then un-skip the test case.
 - **SEI's pushed-P I bit** is now I=1 (silicon-correct) — no follow-up needed.
+
+## 2026-05-03 — Coalesce FETCH-case bodies into a single shared instance
+
+### What we did
+Replaced the ~150 per-opcode `TAWNY_FETCH_OPCODE_CASE` expansions with one shared body at case `0x7FF` (the same slot `set_pc()` already used as a synthetic bootstrap tstate). Mechanism:
+
+- `TAWNY_NEXT_OPCODE_FETCH` no longer takes a per-opcode FETCH-case label as its resume target — it always schedules `0x7FF` for STEP_TAIL's horizon-hit goto exit, and follows the tick with `goto fetch_opcode` so the non-horizon path jumps directly to the shared body without a round-trip through the switch dispatch.
+- A new `TAWNY_FETCH_OPCODE_BODY` macro emits `case 0x7FFu: fetch_opcode: { ... }` and is used exactly once in the switch. The `fetch_opcode:` label is what each instruction's last step gotos directly.
+- The old `TAWNY_FETCH_OPCODE_CASE(OP, STEP)` macro now expands to nothing — its call sites at the end of every addressing-mode macro are inert. Left in place for now as a soft marker; mechanical cleanup is a follow-up.
+
+### Performance
+Median Dormann functional clock: **~870 MHz → ~940 MHz** (~8% recovery, about a third of the IRQ overhead). Cycle count unchanged at 96 249 816.
+
+| Variant | Effective clock |
+|---|---|
+| Pre-IRQ baseline | ~1075 MHz |
+| Post-IRQ (per-opcode FETCH) | ~870 MHz |
+| Coalesced FETCH (current) | ~940 MHz |
+
+### Why this works
+Each per-opcode FETCH-case body was identical machine code (~50 bytes × 150 opcodes = ~7.5KB of duplicated body). Modern compilers do tail-merge identical case bodies via the jump table — but the bodies still occupy distinct positions for fall-through purposes. Coalescing into a single body shrinks the function's total code size and concentrates the FETCH machinery in one icache line. The added `goto fetch_opcode` is a static unconditional JMP that costs ~1 cycle on modern CPUs; the icache and BTB win outweighs it on this workload.
+
+### Test fallout
+Two tests probed `cpu.tstate` for per-opcode FETCH-case labels (`((0x00 << 3) | 6)` for the post-reset state, `((0x4C << 3) | 2)` for the JMP-to-self trap). Both updated to `0x7FFu` to reflect the shared FETCH dispatch slot. The semantics — "next thing to run is an opcode fetch" — are unchanged; only the encoding moved.
+
+### Design decisions
+- **`goto fetch_opcode` instead of breaking out and re-dispatching.** A `break` would force the loop to re-evaluate `current < horizon` and re-enter the switch with `tst = 0x7FF`. The goto skips both: the label is in the same function, the JMP is direct, no jump-table lookup. This was the user's explicit suggestion — keeps coalescing from being a perf regression.
+- **Keep the `0x7FF` slot.** It was already the synthetic bootstrap tstate from `set_pc()`. Co-opting it for the shared FETCH means `set_pc()` and the run-time FETCH path naturally converge on the same code.
+- **Cleanup pass.** Stripped the trailing `[[fallthrough]]; TAWNY_FETCH_OPCODE_CASE(OPCODE, N)` lines from every addressing macro (~30 sites), removed the now-empty `TAWNY_FETCH_OPCODE_CASE` macro and its `#undef`, and dropped the unused `NEXT_TST` argument from `TAWNY_NEXT_OPCODE_FETCH` — the macro is now object-like and `STEP_TAIL` hardcodes `0x7FFu` as the resume tstate. No leftover scaffolding from the per-opcode FETCH layout.

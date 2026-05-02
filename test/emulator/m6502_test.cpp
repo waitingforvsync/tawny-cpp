@@ -45,7 +45,7 @@ TEST_CASE("M6502: reset runs BRK microcode with BrkFlags::Reset") {
     CHECK(returned == 7);
     CHECK(cpu.cycle == 7);
     CHECK(cpu.pc == 0x0400);                               // vector target
-    CHECK(cpu.tstate == ((0x00 << 3) | 6));                // BRK step 6 pending
+    CHECK(cpu.tstate == 0x7FFu);                           // shared opcode-fetch pending
     CHECK(cpu.brk_flags == 0);                             // cleared in step 5
     CHECK(cpu.pending_addr == 0x0400);
     CHECK(cpu.s == 0xFD);                                  // 0 - 3 decrements
@@ -226,7 +226,7 @@ TEST_CASE("M6502: JMP-to-self trap stops the timeslice via access_cost stop") {
     CHECK(cpu.cycle == 10);
     CHECK(cpu.pc == 0x0400);
     CHECK(cpu.pending_addr == 0x0400);
-    CHECK(cpu.tstate == ((0x4C << 3) | 2));
+    CHECK(cpu.tstate == 0x7FFu);                           // shared opcode-fetch pending
 }
 
 // =============================================================================

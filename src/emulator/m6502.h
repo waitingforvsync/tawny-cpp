@@ -360,11 +360,16 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     addr = static_cast<std::uint16_t>(0x0100u | r.s);                         \
     TAWNY_STEP_TAIL(access_cost_stack(r.s), (NEXT_TST))
 
-// Shorthand: set the next phi2 to an opcode fetch at PC, then run the tail.
-// (Used at the end of every penultimate step.)
-#define TAWNY_NEXT_OPCODE_FETCH(NEXT_TST)                                     \
+// Tick the cycle that performs the next opcode fetch, then jump to the single
+// shared FETCH body (case 0x7FF / `fetch_opcode:` label — see
+// TAWNY_FETCH_OPCODE_BODY). All instructions terminate via this macro, so
+// there's only one copy of the FETCH machine code in the binary instead of
+// one per opcode. STEP_TAIL's horizon-hit exit writes 0x7FF into `tst` so
+// the next call to run_until resumes inside the shared FETCH body.
+#define TAWNY_NEXT_OPCODE_FETCH                                               \
     addr = pc;                                                                \
-    TAWNY_STEP_TAIL(access_cost_opcode(addr), (NEXT_TST))
+    TAWNY_STEP_TAIL(access_cost_opcode(addr), 0x7FFu);                        \
+    goto fetch_opcode
 
 // TAWNY_POLL — sample IRQ/NMI lines into brk_flags. Inserted at the START of
 // the polling step's body, BEFORE any read/write — the access in that step
@@ -377,14 +382,20 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         ((config.is_irq() << BrkFlags::IrqBit) & ~r.p) |                      \
         (config.is_nmi() << BrkFlags::NmiBit))
 
-// FETCH_OPCODE_CASE — the last step of every instruction. brk_flags carries
-// the previous instruction's poll result; if non-zero, dispatch BRK (and don't
-// poll again — interrupt sequences don't poll). Otherwise poll first, then
-// read the opcode, shift it into a step-0 tstate, set up the operand-fetch
-// address, and break out so the loop re-enters the switch at the new tstate.
-
-#define TAWNY_FETCH_OPCODE_CASE(OPCODE, STEP)                                 \
-    case ((OPCODE) << 3) | (STEP): {                                          \
+// TAWNY_FETCH_OPCODE_BODY — the single shared FETCH case. brk_flags carries
+// the previous instruction's poll result; if non-zero, dispatch BRK (and
+// don't poll again — interrupt sequences don't poll). Otherwise poll first,
+// then read the opcode, shift it into a step-0 tstate, set up the operand-
+// fetch address, and break out so the loop re-enters the switch at the new
+// tstate.
+//
+// Reached two ways: (a) every TAWNY_NEXT_OPCODE_FETCH gotos `fetch_opcode:`
+// directly (avoids the round trip through the switch dispatch), and (b)
+// after a horizon-hit exit-and-resume, run_until's switch dispatches case
+// 0x7FF, whose body is this same code via fall-through to the label.
+#define TAWNY_FETCH_OPCODE_BODY                                               \
+    case 0x7FFu:                                                              \
+    fetch_opcode:                                                             \
         if (!brk_flags) {                                                     \
             TAWNY_POLL;                                                       \
             ++pc;                                                             \
@@ -395,8 +406,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         }                                                                     \
         addr = pc;                                                            \
         TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
-        break;                                                                \
-    }
+        break
 
 // IMPLIED(OPCODE, OP_CLASS) — 2 cycles. Step 0 is a discarded operand-fetch
 // read; pc is NOT incremented (implied ops consume no bytes after the opcode).
@@ -405,10 +415,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     case ((OPCODE) << 3) | 0: {                                               \
         (void)config.read(addr);                                              \
         OP_CLASS::apply(r);                                                   \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 1)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // IMM_READ(OPCODE, OP_CLASS) — 2 cycles. Step 0 reads the immediate byte and
 // applies the op; pc advances past it.
@@ -417,10 +425,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     case ((OPCODE) << 3) | 0: {                                               \
         ++pc;                                                                 \
         OP_CLASS::apply(r, config.read(addr));                                \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 1)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // ZP_READ(OPCODE, OP_CLASS) — 3 cycles.
 //   step 0: read ZP-addr byte, stash in addr (high bits 0).
@@ -439,10 +445,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     case ((OPCODE) << 3) | 1: {                                               \
         OP_CLASS::apply(r,                                                    \
             config.read_zp(static_cast<std::uint8_t>(addr)));                 \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 2)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // ZP_WRITE(OPCODE, OP_CLASS) — 3 cycles.
 //   step 0: read ZP-addr byte.
@@ -461,10 +465,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     case ((OPCODE) << 3) | 1: {                                               \
         config.write_zp(static_cast<std::uint8_t>(addr),                      \
                         OP_CLASS::value(r));                                  \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 2)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // ABS_READ(OPCODE, OP_CLASS) — 4 cycles.
 //   step 0: read addr lo (into base).
@@ -491,10 +493,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 2: {                                               \
         OP_CLASS::apply(r, config.read(addr));                                \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // ABS_JUMP(OPCODE) — JMP abs, 3 cycles. No op class; updates pc in place.
 //   step 0: read addr lo (into base).
@@ -514,10 +514,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         pc = static_cast<std::uint16_t>(                                      \
             (base & 0x00FFu) |                                                \
             (config.read(addr) << 8));                                        \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 2)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // ABS_WRITE(OPCODE, OP_CLASS) — 4 cycles. Like ABS_READ but the final step
 // writes OP_CLASS::value(cpu) instead of reading.
@@ -540,10 +538,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 2: {                                               \
         config.write(addr, OP_CLASS::value(r));                               \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // ZP_INDEXED_READ / ZP_INDEXED_WRITE — 4 cycles. Parameterised by index reg
 // (X or Y). The indexed-zp address wraps within ZP ((base + idx) & 0xFF).
@@ -567,10 +563,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     case ((OPCODE) << 3) | 2: {                                               \
         OP_CLASS::apply(r,                                                    \
             config.read_zp(static_cast<std::uint8_t>(addr)));                 \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 #define TAWNY_ZP_INDEXED_WRITE(OPCODE, OP_CLASS, IDX)                         \
     case ((OPCODE) << 3) | 0: {                                               \
@@ -592,10 +586,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     case ((OPCODE) << 3) | 2: {                                               \
         config.write_zp(static_cast<std::uint8_t>(addr),                      \
                         OP_CLASS::value(r));                                  \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 #define TAWNY_ZPX_READ(OPCODE, OP_CLASS)  TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, r.x)
 #define TAWNY_ZPY_READ(OPCODE, OP_CLASS)  TAWNY_ZP_INDEXED_READ(OPCODE, OP_CLASS, r.y)
@@ -648,10 +640,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
         OP_CLASS::apply(r, config.read(addr));                                \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 4)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // ABS_INDEXED_WRITE — always 5 cycles (no skip — penalty always paid).
 #define TAWNY_AB_INDEXED_WRITE(OPCODE, OP_CLASS, IDX)                         \
@@ -684,10 +674,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
         config.write(addr, OP_CLASS::value(r));                               \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 4)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 #define TAWNY_ABX_READ(OPCODE, OP_CLASS)  TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, r.x)
 #define TAWNY_ABY_READ(OPCODE, OP_CLASS)  TAWNY_AB_INDEXED_READ(OPCODE, OP_CLASS, r.y)
@@ -733,10 +721,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 4: {                                               \
         OP_CLASS::apply(r, config.read(addr));                                \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 #define TAWNY_IZX_WRITE(OPCODE, OP_CLASS)                                     \
     case ((OPCODE) << 3) | 0: {                                               \
@@ -775,10 +761,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 4: {                                               \
         config.write(addr, OP_CLASS::value(r));                               \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // IZY (indirect),Y read/write — 5 or 6 cycles for reads (page-cross
 // penalty); always 6 for writes.
@@ -827,10 +811,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 4: {                                               \
         OP_CLASS::apply(r, config.read(addr));                                \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 #define TAWNY_IZY_WRITE(OPCODE, OP_CLASS)                                     \
     case ((OPCODE) << 3) | 0: {                                               \
@@ -868,10 +850,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 4: {                                               \
         config.write(addr, OP_CLASS::value(r));                               \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // ACC_RMW(OPCODE, OP_CLASS) — ASL A / LSR A / ROL A / ROR A. 2 cycles:
 // dummy operand read, apply op to A, fetch_opcode.
@@ -879,10 +859,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     case ((OPCODE) << 3) | 0: {                                               \
         (void)config.read(addr);                                              \
         r.a = OP_CLASS::apply(r, r.a);                                        \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 1);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 1)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // RMW addressing modes. Each does a read-modify-write: read original value,
 // dummy-write it back, then write the transformed value. 6502 quirk.
@@ -914,10 +892,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     case ((OPCODE) << 3) | 3: {                                               \
         config.write_zp(static_cast<std::uint8_t>(addr),                      \
                         static_cast<std::uint8_t>(base));                     \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 4)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 #define TAWNY_ZPX_RMW(OPCODE, OP_CLASS)                                       \
     case ((OPCODE) << 3) | 0: {                                               \
@@ -953,10 +929,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     case ((OPCODE) << 3) | 4: {                                               \
         config.write_zp(static_cast<std::uint8_t>(addr),                      \
                         static_cast<std::uint8_t>(base));                     \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 #define TAWNY_ABS_RMW(OPCODE, OP_CLASS)                                       \
     case ((OPCODE) << 3) | 0: {                                               \
@@ -988,10 +962,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 4: {                                               \
         config.write(addr, static_cast<std::uint8_t>(base));                  \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 #define TAWNY_AB_INDEXED_RMW(OPCODE, OP_CLASS, IDX)                           \
     case ((OPCODE) << 3) | 0: {                                               \
@@ -1033,10 +1005,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 5: {                                               \
         config.write(addr, static_cast<std::uint8_t>(base));                  \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 6);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 6)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 #define TAWNY_ABX_RMW(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_RMW(OPCODE, OP_CLASS, r.x)
 #define TAWNY_ABY_RMW(OPCODE, OP_CLASS) TAWNY_AB_INDEXED_RMW(OPCODE, OP_CLASS, r.y)
@@ -1090,10 +1060,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 6: {                                               \
         config.write(addr, static_cast<std::uint8_t>(base));                  \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 7);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 7)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // IZY_RMW — 8 cycles. Always pays the page-cross fix-up (like IZY_WRITE).
 #define TAWNY_IZY_RMW(OPCODE, OP_CLASS)                                       \
@@ -1143,10 +1111,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 6: {                                               \
         config.write(addr, static_cast<std::uint8_t>(base));                  \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 7);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 7)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // JMP (indirect) — 5 cycles. The NMOS 6502 has a well-known page-wrap bug:
 // when the pointer low byte is at $xxFF, the high byte is fetched from $xx00
@@ -1181,10 +1147,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         pc = static_cast<std::uint16_t>(                                      \
             (base & 0x00FFu) |                                                \
             (config.read(addr) << 8));                                        \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 4);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 4)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // JSR — 6 cycles. Reads addr lo, dummies a stack read, pushes PCH, pushes
 // PCL, reads addr hi (now forming the jump target), then fetch_opcode.
@@ -1218,10 +1182,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         pc = static_cast<std::uint16_t>(                                      \
             (base & 0x00FFu) |                                                \
             (config.read(addr) << 8));                                        \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // RTS — 6 cycles. Dummy operand read, dummy stack read, pull PCL, pull PCH
 // (forming PC), dummy read at PC (pc++ afterwards), fetch_opcode.
@@ -1255,10 +1217,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     case ((OPCODE) << 3) | 4: {                                               \
         (void)config.read(addr);                                              \
         ++pc;                                                                 \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // RTI — 6 cycles. Dummy operand read, dummy stack read, pull P, pull PCL,
 // pull PCH (forming PC), fetch_opcode.
@@ -1292,10 +1252,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         pc = static_cast<std::uint16_t>(                                      \
             (base & 0x00FFu) |                                                \
             (config.read_stack(r.s) << 8));                                   \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 5);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 5)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // PHA / PHP — 3 cycles. Dummy operand read, push OP_CLASS::value(cpu),
 // fetch_opcode.
@@ -1309,10 +1267,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     case ((OPCODE) << 3) | 1: {                                               \
         config.write_stack(r.s, OP_CLASS::value(r));                          \
         --r.s;                                                                \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 2);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 2)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // PLA / PLP — 4 cycles. Dummy operand read, dummy stack read (pre-increment),
 // pull byte and apply to CPU via OP_CLASS::apply(cpu, pulled), fetch_opcode.
@@ -1331,10 +1287,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 2: {                                               \
         OP_CLASS::apply(r, config.read_stack(r.s));                           \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // JAM — halts the CPU on an illegal opcode by redirecting the next phi2 back
 // to the same opcode, which the Dormann trap detection catches. Simple stub.
@@ -1426,10 +1380,8 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
             config.consume_nmi();                                             \
         }                                                                     \
         brk_flags = 0;                                                        \
-        TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 6);                         \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 6)
+        TAWNY_NEXT_OPCODE_FETCH;                                              \
+    }
 
 // REL_BRANCH(OPCODE, COND) — 2/3/4 cycles. Three outcomes:
 //   not-taken — fall straight through to step 3 (opcode fetch).
@@ -1462,13 +1414,13 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
             }                                                                 \
         }                                                                     \
         if (!_taken) {                                                        \
-            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                     \
+            TAWNY_NEXT_OPCODE_FETCH;                                          \
         } else if (!_cross) {                                                 \
             addr = pc;                                                        \
             TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 1);          \
     case ((OPCODE) << 3) | 1:                                                 \
             (void)config.read(addr);                                          \
-            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                     \
+            TAWNY_NEXT_OPCODE_FETCH;                                          \
         } else {                                                              \
             addr = pc;                                                        \
             TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);          \
@@ -1476,11 +1428,9 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
             TAWNY_POLL;                                                       \
             (void)config.read(addr);                                          \
             pc = base;                                                        \
-            TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                     \
+            TAWNY_NEXT_OPCODE_FETCH;                                          \
         }                                                                     \
-    }                                                                         \
-    [[fallthrough]];                                                          \
-    TAWNY_FETCH_OPCODE_CASE(OPCODE, 3)
+    }
 
 // -----------------------------------------------------------------------------
 // MOS 6502 emulator — deferred-synchronisation, fall-through dispatch.
@@ -1754,10 +1704,15 @@ struct M6502 {
                 TAWNY_IMPLIED   (0xF8, detail::Sed)          // SED
                 TAWNY_ABX_RMW   (0xFE, detail::Inc)          // INC abs,X
 
-                // Synthetic "bootstrap opcode fetch" tstate (0x7FF) used by
-                // set_pc(). Step 7 isn't produced by normal dispatch (longest
-                // instruction = 7 cycles, steps 0-6), so this slot is free.
-                TAWNY_FETCH_OPCODE_CASE(0xFF, 7)
+                // Shared opcode-fetch body at tstate 0x7FF. Every instruction's
+                // last step ticks one cycle (via TAWNY_NEXT_OPCODE_FETCH) and
+                // then `goto fetch_opcode` jumps directly here. set_pc() also
+                // seeds tstate=0x7FF so the first dispatch lands here. The
+                // 0x7FF slot is free because real dispatch only produces
+                // tstates up to (opcode<<3 | step) where step<=6 (longest
+                // instruction is 8 cycles, steps 0-6 plus the FETCH that's
+                // now coalesced).
+                TAWNY_FETCH_OPCODE_BODY;
 
                 // Illegal opcodes (JAM stubs + stable illegals) in numeric order.
                 TAWNY_JAM       (0x02)                       // JAM*
@@ -1898,7 +1853,8 @@ struct M6502 {
 #undef TAWNY_STEP_TAIL
 #undef TAWNY_NEXT_STACK
 #undef TAWNY_NEXT_OPCODE_FETCH
-#undef TAWNY_FETCH_OPCODE_CASE
+#undef TAWNY_FETCH_OPCODE_BODY
+#undef TAWNY_POLL
 #undef TAWNY_BRK
 #undef TAWNY_IMPLIED
 #undef TAWNY_IMM_READ
