@@ -31,9 +31,12 @@ struct AccessCost {
 // during instruction execution; consumed at FETCH (where non-zero diverts to
 // BRK microcode) and at BRK step 5 (cleared after vector load).
 struct BrkFlags {
-    static constexpr unsigned   IrqBit   = 0;
-    static constexpr unsigned   NmiBit   = 1;
-    static constexpr unsigned   ResetBit = 2;
+    // IrqBit aligned with `flag::I` bit position so the poll formula can use
+    // `~r.p` as the I-mask directly: `(is_irq() << IrqBit) & ~r.p` is set iff
+    // IRQ is pending AND I is clear. Branchless, no separate I check.
+    static constexpr unsigned   IrqBit   = 2;
+    static constexpr unsigned   NmiBit   = 0;
+    static constexpr unsigned   ResetBit = 1;
     static constexpr std::uint8_t Irq    = 1u << IrqBit;
     static constexpr std::uint8_t Nmi    = 1u << NmiBit;
     static constexpr std::uint8_t Reset  = 1u << ResetBit;
@@ -371,7 +374,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 // addressing macro.
 #define TAWNY_POLL                                                            \
     brk_flags = static_cast<std::uint8_t>(                                    \
-        ((!(r.p & flag::I) && config.is_irq()) << BrkFlags::IrqBit) |         \
+        ((config.is_irq() << BrkFlags::IrqBit) & ~r.p) |                      \
         (config.is_nmi() << BrkFlags::NmiBit))
 
 // FETCH_OPCODE_CASE — the last step of every instruction. brk_flags carries
