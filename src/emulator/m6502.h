@@ -26,26 +26,18 @@ struct AccessCost {
     bool stop;
 };
 
-// BRK entry cause. Bitmask so interrupts can in future be raised concurrently
-// and priorities resolved at dispatch time. (Stage 1 uses Reset only; IRQ/NMI
-// dispatch is a follow-up.)
-enum class BrkFlags : std::uint8_t {
-    None  = 0,
-    Reset = 1,
-    Irq   = 2,
-    Nmi   = 4,
+// BRK entry cause. Bitmask: any combination of bits can be set; BRK's vector
+// selection at step 3 picks Reset > Nmi > Irq. Polled at every TAWNY_POLL site
+// during instruction execution; consumed at FETCH (where non-zero diverts to
+// BRK microcode) and at BRK step 5 (cleared after vector load).
+struct BrkFlags {
+    static constexpr unsigned   IrqBit   = 0;
+    static constexpr unsigned   NmiBit   = 1;
+    static constexpr unsigned   ResetBit = 2;
+    static constexpr std::uint8_t Irq    = 1u << IrqBit;
+    static constexpr std::uint8_t Nmi    = 1u << NmiBit;
+    static constexpr std::uint8_t Reset  = 1u << ResetBit;
 };
-
-constexpr auto operator|(BrkFlags a, BrkFlags b) -> BrkFlags
-{
-    return static_cast<BrkFlags>(
-        static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b));
-}
-constexpr auto operator&(BrkFlags a, BrkFlags b) -> BrkFlags
-{
-    return static_cast<BrkFlags>(
-        static_cast<std::uint8_t>(a) & static_cast<std::uint8_t>(b));
-}
 
 // The bus/memory interface the CPU uses to reach the outside world.
 //
@@ -70,6 +62,9 @@ concept M6502Config = requires(T &cfg,
     { cfg.access_cost_stack(zp)    } -> std::same_as<AccessCost>;
     { cfg.access_cost_vector(addr) } -> std::same_as<AccessCost>;
     { cfg.access_cost(addr)        } -> std::same_as<AccessCost>;
+    { cfg.is_irq()                 } -> std::same_as<bool>;
+    { cfg.is_nmi()                 } -> std::same_as<bool>;
+    { cfg.consume_nmi()            } -> std::same_as<void>;
 };
 
 // Status-register flag bits (P).
@@ -368,15 +363,33 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     addr = pc;                                                                \
     TAWNY_STEP_TAIL(access_cost_opcode(addr), (NEXT_TST))
 
-// FETCH_OPCODE_CASE — the last step of every instruction. Reads the next
-// opcode byte (via read_opcode for the sync-read semantics), shifts it into a
-// step-0 tstate for the new instruction, sets up the operand-fetch address,
-// and breaks out so the while loop re-enters the switch at the new tstate.
+// TAWNY_POLL — sample IRQ/NMI lines into brk_flags. Inserted at the START of
+// the polling step's body, BEFORE any read/write — the access in that step
+// must not be able to alter the interrupt lines and have it observed in the
+// same cycle (which silicon can't do). Used at FETCH (covers 2-cycle ops as
+// silicon's penultimate) and at the second-to-last cycle of each multi-cycle
+// addressing macro.
+#define TAWNY_POLL                                                            \
+    brk_flags = static_cast<std::uint8_t>(                                    \
+        ((!(r.p & flag::I) && config.is_irq()) << BrkFlags::IrqBit) |         \
+        (config.is_nmi() << BrkFlags::NmiBit))
+
+// FETCH_OPCODE_CASE — the last step of every instruction. brk_flags carries
+// the previous instruction's poll result; if non-zero, dispatch BRK (and don't
+// poll again — interrupt sequences don't poll). Otherwise poll first, then
+// read the opcode, shift it into a step-0 tstate, set up the operand-fetch
+// address, and break out so the loop re-enters the switch at the new tstate.
 
 #define TAWNY_FETCH_OPCODE_CASE(OPCODE, STEP)                                 \
     case ((OPCODE) << 3) | (STEP): {                                          \
-        ++pc;                                                                 \
-        tst  = static_cast<std::uint16_t>(config.read_opcode(addr) << 3);     \
+        if (!brk_flags) {                                                     \
+            TAWNY_POLL;                                                       \
+            ++pc;                                                             \
+            tst  = static_cast<std::uint16_t>(config.read_opcode(addr) << 3); \
+        } else {                                                              \
+            (void)config.read_opcode(addr);                                   \
+            tst  = 0;                                                         \
+        }                                                                     \
         addr = pc;                                                            \
         TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
         break;                                                                \
@@ -413,6 +426,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 
 #define TAWNY_ZP_READ(OPCODE, OP_CLASS)                                       \
     case ((OPCODE) << 3) | 0: {                                               \
+        TAWNY_POLL;                                                           \
         ++pc;                                                                 \
         addr = config.read(addr);                                             \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
@@ -434,6 +448,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 
 #define TAWNY_ZP_WRITE(OPCODE, OP_CLASS)                                      \
     case ((OPCODE) << 3) | 0: {                                               \
+        TAWNY_POLL;                                                           \
         ++pc;                                                                 \
         addr = config.read(addr);                                             \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
@@ -463,6 +478,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 1: {                                               \
+        TAWNY_POLL;                                                           \
         ++pc;                                                                 \
         addr = static_cast<std::uint16_t>(                                    \
             (base & 0x00FFu) |                                                \
@@ -484,6 +500,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 
 #define TAWNY_ABS_JUMP(OPCODE)                                                \
     case ((OPCODE) << 3) | 0: {                                               \
+        TAWNY_POLL;                                                           \
         ++pc;                                                                 \
         base = config.read(addr);                                             \
         addr = pc;                                                            \
@@ -510,6 +527,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 1: {                                               \
+        TAWNY_POLL;                                                           \
         ++pc;                                                                 \
         addr = static_cast<std::uint16_t>(                                    \
             (base & 0x00FFu) |                                                \
@@ -535,6 +553,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 1: {                                               \
+        TAWNY_POLL;                                                           \
         (void)config.read_zp(static_cast<std::uint8_t>(addr));                \
         addr = static_cast<std::uint16_t>(                                    \
             static_cast<std::uint8_t>(addr + (IDX)));                         \
@@ -559,6 +578,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 1: {                                               \
+        TAWNY_POLL;                                                           \
         (void)config.read_zp(static_cast<std::uint8_t>(addr));                \
         addr = static_cast<std::uint16_t>(                                    \
             static_cast<std::uint8_t>(addr + (IDX)));                         \
@@ -593,6 +613,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 1: {                                               \
+        TAWNY_POLL;                                                           \
         ++pc;                                                                 \
         /* Compute target addr + page-cross flag in a tight sub-scope so      \
            _hi/_lo_sum aren't live at the step-2 case label below (case       \
@@ -613,6 +634,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
             base = static_cast<std::uint16_t>(addr + 0x0100u);                \
             TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);          \
     case ((OPCODE) << 3) | 2:                                                 \
+            TAWNY_POLL;                                                       \
             (void)config.read(addr);                                          \
             addr = base;                                                      \
             TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);          \
@@ -651,6 +673,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 2: {                                               \
+        TAWNY_POLL;                                                           \
         (void)config.read(addr);                                              \
         addr = base;                                                          \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);              \
@@ -697,6 +720,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
+        TAWNY_POLL;                                                           \
         addr = static_cast<std::uint16_t>(                                    \
             (base & 0x00FFu) |                                                \
             (static_cast<std::uint16_t>(                                      \
@@ -738,6 +762,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
+        TAWNY_POLL;                                                           \
         addr = static_cast<std::uint16_t>(                                    \
             (base & 0x00FFu) |                                                \
             (static_cast<std::uint16_t>(                                      \
@@ -771,6 +796,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 2: {                                               \
+        TAWNY_POLL;                                                           \
         /* Same trick as AB_INDEXED_READ: nested step-3 case label inside     \
            the page-cross branch, fall straight through to step 4 on the      \
            common (no-cross) path. _hi/_lo_sum scoped tightly so the case     \
@@ -787,6 +813,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
             base = static_cast<std::uint16_t>(addr + 0x0100u);                \
             TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 3);          \
     case ((OPCODE) << 3) | 3:                                                 \
+            TAWNY_POLL;                                                       \
             (void)config.read(addr);                                          \
             addr = base;                                                      \
             TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);          \
@@ -830,6 +857,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
+        TAWNY_POLL;                                                           \
         (void)config.read(addr);                                              \
         addr = base;                                                          \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);              \
@@ -872,6 +900,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 2: {                                               \
+        TAWNY_POLL;                                                           \
         config.write_zp(static_cast<std::uint8_t>(addr),                      \
                         static_cast<std::uint8_t>(base));                     \
         base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));           \
@@ -910,6 +939,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
+        TAWNY_POLL;                                                           \
         config.write_zp(static_cast<std::uint8_t>(addr),                      \
                         static_cast<std::uint8_t>(base));                     \
         base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));           \
@@ -947,6 +977,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
+        TAWNY_POLL;                                                           \
         config.write(addr, static_cast<std::uint8_t>(base));                  \
         base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));           \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 4);              \
@@ -991,6 +1022,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 4: {                                               \
+        TAWNY_POLL;                                                           \
         config.write(addr, static_cast<std::uint8_t>(base));                  \
         base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));           \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 5);              \
@@ -1047,6 +1079,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 5: {                                               \
+        TAWNY_POLL;                                                           \
         config.write(addr, static_cast<std::uint8_t>(base));                  \
         base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));           \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 6);              \
@@ -1099,6 +1132,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 5: {                                               \
+        TAWNY_POLL;                                                           \
         config.write(addr, static_cast<std::uint8_t>(base));                  \
         base = OP_CLASS::apply(r, static_cast<std::uint8_t>(base));           \
         TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 6);              \
@@ -1131,6 +1165,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 2: {                                               \
+        TAWNY_POLL;                                                           \
         base = config.read(addr);                                             \
         /* NMOS bug: +1 wraps within the same page. */                        \
         addr = static_cast<std::uint16_t>(                                    \
@@ -1169,6 +1204,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
+        TAWNY_POLL;                                                           \
         config.write_stack(r.s, static_cast<std::uint8_t>(pc));               \
         --r.s;                                                                \
         addr = pc;                                                            \
@@ -1205,6 +1241,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
+        TAWNY_POLL;                                                           \
         pc = static_cast<std::uint16_t>(                                      \
             (base & 0x00FFu) |                                                \
             (config.read_stack(r.s) << 8));                                   \
@@ -1242,6 +1279,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
+        TAWNY_POLL;                                                           \
         base = config.read_stack(r.s);                                        \
         ++r.s;                                                                \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 4);                                \
@@ -1260,6 +1298,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 // fetch_opcode.
 #define TAWNY_PUSH(OPCODE, OP_CLASS)                                          \
     case ((OPCODE) << 3) | 0: {                                               \
+        TAWNY_POLL;                                                           \
         (void)config.read(addr);                                              \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                                \
     }                                                                         \
@@ -1281,6 +1320,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 1: {                                               \
+        TAWNY_POLL;                                                           \
         (void)config.read_stack(r.s);                                         \
         ++r.s;                                                                \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 2);                                \
@@ -1323,14 +1363,14 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 #define TAWNY_BRK(OPCODE)                                                     \
     case ((OPCODE) << 3) | 0: {                                               \
         (void)config.read(addr);                                              \
-        if (brk_flags == BrkFlags::None) {                                    \
+        if (!brk_flags) {                                                     \
             ++pc;                                                             \
         }                                                                     \
         TAWNY_NEXT_STACK(((OPCODE) << 3) | 1);                                \
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 1: {                                               \
-        if (brk_flags == BrkFlags::Reset) {                                   \
+        if (brk_flags & BrkFlags::Reset) {                                    \
             (void)config.read_stack(r.s);                                     \
         } else {                                                              \
             config.write_stack(r.s, static_cast<std::uint8_t>(pc >> 8));      \
@@ -1340,7 +1380,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 2: {                                               \
-        if (brk_flags == BrkFlags::Reset) {                                   \
+        if (brk_flags & BrkFlags::Reset) {                                    \
             (void)config.read_stack(r.s);                                     \
         } else {                                                              \
             config.write_stack(r.s, static_cast<std::uint8_t>(pc));           \
@@ -1350,18 +1390,21 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case ((OPCODE) << 3) | 3: {                                               \
-        if (brk_flags == BrkFlags::Reset) {                                   \
+        if (brk_flags & BrkFlags::Reset) {                                    \
             (void)config.read_stack(r.s);                                     \
         } else {                                                              \
-            std::uint8_t _pushed_p = (brk_flags == BrkFlags::None)            \
+            std::uint8_t _pushed_p = (brk_flags == 0)                         \
                 ? static_cast<std::uint8_t>(r.p | flag::B | flag::U)          \
                 : static_cast<std::uint8_t>(r.p | flag::U);                   \
             config.write_stack(r.s, _pushed_p);                               \
         }                                                                     \
         --r.s;                                                                \
         r.p = static_cast<std::uint8_t>(r.p | flag::I);                       \
-        addr = (brk_flags == BrkFlags::Nmi)   ? 0xFFFAu                       \
-             : (brk_flags == BrkFlags::Reset) ? 0xFFFCu                       \
+        /* NMI hijack: a late NMI edge captured during BRK steps 1-3          \
+           overrides the original IRQ/SW-BRK vector. */                       \
+        if (config.is_nmi()) brk_flags |= BrkFlags::Nmi;                      \
+        addr = (brk_flags & BrkFlags::Reset) ? 0xFFFCu                        \
+             : (brk_flags & BrkFlags::Nmi)   ? 0xFFFAu                        \
              :                                  0xFFFEu;                      \
         TAWNY_STEP_TAIL(access_cost_vector(addr), ((OPCODE) << 3) | 4);       \
     }                                                                         \
@@ -1376,7 +1419,10 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         pc = static_cast<std::uint16_t>(                                      \
             (base & 0x00FFu) |                                                \
             (config.read_vector(addr) << 8));                                 \
-        brk_flags = BrkFlags::None;                                           \
+        if (brk_flags & BrkFlags::Nmi) {                                      \
+            config.consume_nmi();                                             \
+        }                                                                     \
+        brk_flags = 0;                                                        \
         TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 6);                         \
     }                                                                         \
     [[fallthrough]];                                                          \
@@ -1424,6 +1470,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
             addr = pc;                                                        \
             TAWNY_STEP_TAIL(access_cost(addr), ((OPCODE) << 3) | 2);          \
     case ((OPCODE) << 3) | 2:                                                 \
+            TAWNY_POLL;                                                       \
             (void)config.read(addr);                                          \
             pc = base;                                                        \
             TAWNY_NEXT_OPCODE_FETCH(((OPCODE) << 3) | 3);                     \
@@ -1461,7 +1508,7 @@ struct M6502 {
     std::uint8_t  y{};                             // 12
     std::uint8_t  s{0xFD};                         // 13
     std::uint8_t  p{flag::I | flag::U};            // 14
-    BrkFlags      brk_flags{BrkFlags::Reset};      // 15  (packs next to p)
+    std::uint8_t  brk_flags{BrkFlags::Reset};      // 15  (packs next to p)
 
     // Emulation state.
     std::uint16_t tstate{};                        // 16  (ir << 3) | step
@@ -1517,32 +1564,24 @@ struct M6502 {
         pc           = target;
         pending_addr = target;
         tstate       = 0x7FF;
-        brk_flags    = BrkFlags::None;
+        brk_flags    = 0;
         cycle        = config.access_cost_opcode(target).cost;
     }
 
-    // Stage 1 stub — the single place IRQ/NMI signals would be observed at
-    // the boundary of a timeslice. IRQ/NMI pipeline is a follow-up.
-    auto sample_interrupts() -> void {}
-
-    auto irq() -> void { /* TODO: interrupt pipeline */ }
-    auto nmi() -> void { /* TODO: interrupt pipeline */ }
-
     auto run_until(Cycle horizon) -> Cycle
     {
-        sample_interrupts();
-
         // Hot state is cached in stack locals for the duration of the loop
         // and written back at `exit:`. Empirically worth ~30-35% over
         // struct-field references — the compiler can't hoist the fields
         // into registers across `config.*` calls, because `config` is a
         // member of `*this` and alias analysis conservatively assumes a
         // call through one member could touch others.
-        auto current = cycle;
-        auto addr    = pending_addr;
-        auto tst     = tstate;
-        auto base    = base_addr;
-        auto pc      = this->pc;   // shadow member so macros can write bare `pc`
+        auto current   = cycle;
+        auto addr      = pending_addr;
+        auto tst       = tstate;
+        auto base      = base_addr;
+        auto pc        = this->pc;   // shadow member so macros can write bare `pc`
+        auto brk_flags = this->brk_flags;
         // Single register-file local. Ops take it by reference and mutate
         // fields in place — one aggregate, no pack/unpack at call sites.
         auto r       = detail::Registers{this->a, this->x, this->y, this->s, this->p};
@@ -1835,16 +1874,17 @@ struct M6502 {
         }
 
     exit:
-        cycle        = current;
-        pending_addr = addr;
-        tstate       = tst;
-        base_addr    = base;
-        this->pc     = pc;
-        this->a      = r.a;
-        this->x      = r.x;
-        this->y      = r.y;
-        this->s      = r.s;
-        this->p      = r.p;
+        cycle           = current;
+        pending_addr    = addr;
+        tstate          = tst;
+        base_addr       = base;
+        this->pc        = pc;
+        this->brk_flags = brk_flags;
+        this->a         = r.a;
+        this->x         = r.x;
+        this->y         = r.y;
+        this->s         = r.s;
+        this->p         = r.p;
         return current;
     }
 };

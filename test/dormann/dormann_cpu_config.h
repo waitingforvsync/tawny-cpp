@@ -51,6 +51,10 @@ struct DormannCpuConfig {
     auto access_cost_stack(std::uint8_t) const -> AccessCost    { return {1, false}; }
     auto access_cost_vector(std::uint16_t) const -> AccessCost  { return {1, false}; }
     auto access_cost(std::uint16_t) const -> AccessCost         { return {1, false}; }
+
+    auto is_irq() const -> bool { return false; }
+    auto is_nmi() const -> bool { return false; }
+    auto consume_nmi() -> void {}
 };
 
 }  // namespace tawny::dormann

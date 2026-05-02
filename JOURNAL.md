@@ -261,3 +261,50 @@ Captured as constants in `interrupt_test_bin.h` so we don't lose track before th
 - Read semantics: returns the last latched value.
 - `feedback_write_mask = 0x7F` — bit 7 is filtered on write (used as a diag-stop in the original hardware variants; we drop it).
 - The test never touches DDR (`I_ddr = 0` in the source) and assumes `I_drive = 1` (open-collector).
+
+## 2026-05-03 — IRQ / NMI pipeline (v2): pipeline-event polling
+
+### What we did
+Implemented IRQ/NMI servicing on the CPU core, on the second attempt. The first attempt (35ab26b / 2f278ad) used an absolute-cycle-timestamp model — `int_cycle <= current` checked at FETCH — and was reverted (17a659f / 86c646c) because that compare doesn't survive per-access cycle stretching: when `cost > 1`, the gap between penultimate and FETCH varies, so absolute time at FETCH no longer corresponds to "IRQ asserted by phi2 of penultimate".
+
+The new approach anchors polling to a **pipeline event** — a specific case-label body — instead of to simulated time. Concretely:
+
+- `BrkFlags` is now a `uint8_t` bitmask (`Irq=1 | Nmi=2 | Reset=4`) with `IrqBit/NmiBit/ResetBit` shift-count constants. `brk_flags` (the M6502 member) is `uint8_t`.
+- `M6502Config` gains three methods: `is_irq()` (level), `is_nmi()` (sticky-since-edge in the Config), `consume_nmi()` (CPU clears the latch at handler entry).
+- New `TAWNY_POLL` macro samples both lines into `brk_flags` branchlessly: `brk_flags = ((!(r.p & I) && is_irq()) << IrqBit) | (is_nmi() << NmiBit)`. Inserted at the START of each polling step's body, BEFORE any read/write — the access in that step must not be able to alter interrupt state and have it observed in the same cycle (silicon can't do that).
+- `TAWNY_FETCH_OPCODE_CASE` rewritten: on `!brk_flags`, polls (silicon's penultimate for 2-cycle ops) then reads the opcode and dispatches step 0; on `brk_flags != 0`, dummy-reads and dispatches BRK (`tst = 0`) without polling — the "interrupt sequences don't poll" rule.
+- 22 body-step poll sites added across the addressing macros at `step (N-3)` for an N-cycle macro (silicon's penultimate). Skip-step macros (AB_INDEXED_READ, IZY_READ) get poll at TWO sites — the no-cross penultimate and the cross penultimate — since exactly one of them is reached on each path.
+- `TAWNY_REL_BRANCH`: poll at the taken-cross step-2 body only. Not-taken (2-cycle) and taken-no-cross (3-cycle) inherit the FETCH-only poll. Taken-no-cross's modified-poll quirk ("one cycle earlier than penultimate") falls out naturally because the FETCH-poll already runs one cycle earlier than its body-step penultimate would.
+- `TAWNY_BRK` step 3 re-checks NMI for the hijack quirk: `if (config.is_nmi()) brk_flags |= Nmi`, then vector-selects `Reset > Nmi > Irq`. Step 5 calls `consume_nmi()` if the Nmi bit is set, then clears `brk_flags = 0` so the handler's first FETCH dispatches normally.
+- Removed the stub `sample_interrupts()` / `irq()` / `nmi()` methods on M6502.
+- `run_until` lifts `brk_flags` into a stack local alongside `current` / `addr` / etc., written back at exit.
+
+### Tests
+- 11 IRQ/NMI test cases resurrected from the v1 commit (the underlying behaviour is the same, only the Config interface changed): IRQ-with-I=0, IRQ-masked-by-I, SEI quirk, CLI delay, PLP delay, RTI immediate, taken-no-cross branch eats interrupt, NMI-ignores-I, NMI-priority-over-IRQ, NMI-hijacks-BRK, handler's-first-instruction-always-runs.
+- `ProgrammableInterruptConfig` extends `DormannCpuConfig` with `bool irq_asserted` (level), `bool nmi_pending` + `bool nmi_consumed` (`is_nmi() = nmi_pending && !nmi_consumed`), plus two one-shot helpers used by the trickier tests: `irq_arm_on_next_read` (the branch-eats-interrupt test arms IRQ during the offset-byte read so the FETCH-poll missed it) and `nmi_pending_on_read_at` (the NMI-hijack test raises NMI on BRK's step-0 dummy read so step 3's hijack check fires).
+- 2 new cycle-stretching regression tests: a `StretchingInterruptConfig` returns `cost > 1` for a specific access target. One test arms IRQ during the stretched LAST cycle of LDA $5000 and verifies the IRQ is NOT serviced at LDA's boundary (this is the exact case v1 got wrong — would have triggered erroneously). The other asserts IRQ before the stretched penultimate as a positive control.
+- All 29 test cases pass. Dormann functional cycle count unchanged at 96 249 816. Dormann interrupt test still skipped (separate task: wire `$BFFC` MMIO to `is_irq` / `is_nmi`).
+
+### Performance
+Dormann functional profile, post-IRQ vs pre-IRQ baseline:
+
+| Variant | Effective clock | vs pre-IRQ |
+|---|---|---|
+| Pre-IRQ baseline | ~1075 MHz | — |
+| Branchless overwrite (current) | ~830–870 MHz | -19% / -23% |
+| Branchy OR-into-brk_flags (rejected) | ~700–730 MHz | -32% / -35% |
+
+The branchless overwrite TAWNY_POLL beat the branchy `if (...) brk_flags |= bit;` form by ~140 MHz despite the conditions being well-predicted. ~25M poll sites in the Dormann run amplify even tiny per-site costs; two `cmov`s + a single store wins over two short conditional branches + a possible store.
+
+### Design decisions
+- **Penultimate body step is `step (N-3)` in our model, not `step (N-2)`.** Counted carefully: case label `|0` is silicon T1 (= cycle 2 of the instruction), `|1` is T2, …, `|N-2` is T(N-1) = the last cycle, and the `TAWNY_FETCH_OPCODE_CASE` at the end of the macro is silicon T0 of the *next* instruction (not counted in this instruction's cycles). Penultimate of an N-cycle instruction is silicon T(N-2) = our case `|N-3` = step (N-3). The plan file's first table got this off-by-one and was caught when the user said "in TAWNY_ABS_READ it would be in step 1" — for a 4-cycle ABS_READ, step 1 IS penultimate; if I had implemented step 2, that would be the LAST cycle of the instruction, semantically wrong.
+- **Poll BEFORE the access, not after.** User's hard rule: a memory access that's part of MMIO can affect interrupt lines, and on real silicon that change can't be observed by a poll happening in the same cycle. So `TAWNY_POLL` always lands at the very start of the polling step's body. (Originally I'd written it at the end; the rule sweep moved everything to the start, including the FETCH-side poll which now runs before `read_opcode`.)
+- **Skip-step macros poll at two sites.** AB_INDEXED_READ no-cross is 4 cycles and skips its case `|2` body; cross is 5 cycles and reaches `|2`. Penultimate of 4-cycle = case `|1`; penultimate of 5-cycle = case `|2`. Putting `TAWNY_POLL` at both means each path always polls exactly once at its own penultimate — the no-cross path never visits `|2`, and the cross path's `|1` poll is overwritten by `|2` (correct behaviour).
+- **Taken-no-cross branch quirk emerges for free.** Silicon's modified-poll rule is "taken-no-cross branches poll one cycle earlier than penultimate". For our 3-cycle taken-no-cross, penultimate = step 0; one earlier = FETCH. We already poll at FETCH (FETCH-only for 2-cycle ops, redundantly for 3+). So we just *omit* any body-step poll on the taken-no-cross path — the FETCH-poll IS the modified poll, no special-case macro needed.
+- **NMI semantics: Config-side latch + `consume_nmi()`.** Two reasonable alternatives — CPU-internal edge detection on a level-only `is_nmi()`, or one-shot `is_nmi()` that self-clears — were rejected: the first adds a `nmi_prev` member and edge-compute on every poll; the second forces the CPU to OR (not overwrite) brk_flags so a single read consumes the event, complicating the formula. The Config-side latch matches silicon's "internal NMI latch cleared at NMI vector load" and matches the test config's existing `nmi_consumed` field.
+- **The SEI quirk pushes I=1 in P, matching silicon.** The user's prompt and my initial scepticism converged on the right answer: SEI commits I at end of T1 (silicon's last cycle of SEI); BRK pushes P four cycles later, by which time I=1; so the pushed P has I=1. The v1 implementation gated SEI's I commit on `!take_int` so BRK pushed I=0 — which felt like "preserving the pre-SEI value" but is actually silicon-INACCURATE per NESdev. We push I=1 and a test now positively asserts that.
+- **Branchless overwrite TAWNY_POLL beats branchy OR.** `if (config.is_irq() && !(r.p & I)) brk_flags |= Irq; if (config.is_nmi()) brk_flags |= Nmi;` looked cheaper (well-predicted false branches, no shifts), but lost ~140 MHz vs the branchless mux. The cmov form fits the hot path's pattern of "rare side effect, common no-op" better than two short conditional branches.
+
+### What's still missing
+- **Dormann interrupt test wiring.** `interrupt_test_bin.h` carries the `$BFFC` MMIO contract; we need a Dormann config wrapper that latches writes to `$BFFC` and drives `is_irq()` / `is_nmi()` from the latched byte. Then un-skip the test case.
+- **SEI's pushed-P I bit** is now I=1 (silicon-correct) — no follow-up needed.

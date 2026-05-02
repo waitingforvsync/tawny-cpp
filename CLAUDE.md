@@ -75,13 +75,66 @@ int compute(int x)
   - `test/emulator/` — CPU unit tests + functional-test profiling runner
 - `extern/` — Vendored dependencies (doctest, glad/)
 
+## IRQ / NMI pipeline (implemented)
+
+The `M6502Config` concept exposes three interrupt query methods —
+`is_irq()` (level), `is_nmi()` (sticky-since-edge), `consume_nmi()` (CPU
+acks the NMI latch). `brk_flags` is a `uint8_t` bitmask (`Irq | Nmi |
+Reset`); BRK's vector selection at step 3 picks `Reset > Nmi > Irq`.
+
+Polling is anchored to the **pipeline event** (specific case-label body),
+not to absolute simulated time, so it stays correct under per-access
+cycle stretching. `TAWNY_POLL` runs at the START of the polling step's
+body, BEFORE any read/write — the access in that step must not be able
+to feed back into its own poll on the same cycle. Sites:
+
+- Inside `TAWNY_FETCH_OPCODE_CASE` on the `!brk_flags` branch (silicon's
+  penultimate cycle for 2-cycle ops; redundant-but-harmless for 3+ cycle
+  ops since the body-step poll overrides).
+- Inside the second-to-last body step of every multi-cycle addressing
+  macro (silicon's penultimate cycle for those).
+- For skip-step macros (AB_INDEXED_READ, IZY_READ): at BOTH the no-cross
+  and cross penultimates.
+- For taken-no-cross branches: NO body-step poll — the modified-poll
+  quirk falls out naturally because we already polled at FETCH (one
+  cycle earlier than penultimate, which is the silicon-correct shift).
+
+BRK doesn't poll for IRQ (interrupt sequences don't poll); it does
+re-check NMI at step 3 for the hijack quirk and calls `consume_nmi()`
+at step 5 when servicing NMI. The handler's first instruction always
+runs uninterruptibly because `brk_flags` is cleared at BRK step 5,
+before the handler's FETCH.
+
+SEI/CLI/PLP delayed-I and RTI immediate-I quirks emerge naturally from
+the poll-before-access rule: SEI/CLI's I commit happens in IMPLIED's
+step 0 body (after the FETCH poll, which used pre-instruction I); PLP's
+P commit happens at PULL step 2 (after the step-1 poll, which used
+pre-PLP I); RTI's P commit happens at step 2 (before the step-4 poll,
+so the poll uses post-RTI I).
+
+**Previously attempted (reverted in 17a659f / 86c646c):** an
+absolute-cycle-timestamp model where the config exposed
+`irq_asserted_since() / nmi_edge_at()` and `run_until` cached a single
+`int_cycle` that FETCH compared against `current`. Passed all tests
+under `cost == 1` but broke under stretching — recorded here so we
+don't reinvent it.
+
 ## What still needs doing on the CPU core
-- **IRQ / NMI pipeline.** `sample_interrupts()`, `irq()`, `nmi()` on `M6502` are stubs. The BRK microcode already branches on `brk_flags` for Reset/IRQ/NMI (cleared on entry, vector selection at step 3), so adding interrupts is plumbing rather than microcode: wire up an `int_shift` register for the 2.5-cycle IRQ-sampling delay, edge-detect NMI on the config's signal, and have `sample_interrupts()` (called once at the top of `run_until`) queue a BRK-with-appropriate-flag on the next instruction boundary. `I` flag inhibits IRQ but not NMI.
-  - **Previously attempted (reverted in 17a659f / 86c646c):** an absolute-cycle-timestamp model where the config exposed `irq_asserted_since() / nmi_edge_at()` and `run_until` cached a single `int_cycle` that FETCH compared against `current`. This passed all unit tests + Dormann functional/decimal under `cost == 1` but is structurally unsound: per-access `cost > 1` (BBC Micro 1MHz-bus stretching, supported by the `M6502Config` concept) makes the gap between penultimate and FETCH variable, so an absolute-cycle compare at FETCH no longer corresponds to "IRQ asserted by phi2 of penultimate". Any retry must anchor the poll to a pipeline event (a specific step body), not to absolute simulated time.
-- **SH* / TAS unstable illegals** (0x93, 0x9B, 0x9C, 0x9E, 0x9F). Currently JAM. They need the pre-index high byte preserved across the write step (for the `reg & (H+1)` store value). Would require an extra scratch field on `M6502` or a dedicated macro that stashes the value in the spare high byte of `base`. BBC Micro never used them.
-- **`reset()` as a public operation.** Currently only the constructor calls it. A `cpu.reset()` that resets mid-run would need to reset registers and re-enter BRK microcode with `brk_flags = Reset`.
+- **Dormann interrupt test wiring.** `test/dormann/interrupt_test_bin.h`
+  pokes `$BFFC` mid-`run_until`; we need a Dormann config wrapper that
+  drives `is_irq()` / `is_nmi()` from that latched byte, then un-skip
+  the test.
+- **SH* / TAS unstable illegals** (0x93, 0x9B, 0x9C, 0x9E, 0x9F).
+  Currently JAM. They need the pre-index high byte preserved across the
+  write step (for the `reg & (H+1)` store value). Would require an
+  extra scratch field on `M6502` or a dedicated macro that stashes the
+  value in the spare high byte of `base`. BBC Micro never used them.
+- **`reset()` as a public operation.** Currently only the constructor
+  calls it. A `cpu.reset()` that resets mid-run would need to reset
+  registers and re-enter BRK microcode with `brk_flags = Reset`.
 - **RDY / SO pins.** Rare on BBC Micro; not implemented.
-- **65C02 / 65816 extensions.** Different CPU, separate emulator if needed.
+- **65C02 / 65816 extensions.** Different CPU, separate emulator if
+  needed.
 
 ## Testing
 - Single executable: `./tawny --test` runs tests, otherwise runs the emulator
