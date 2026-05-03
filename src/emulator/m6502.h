@@ -382,19 +382,21 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         ((config.is_irq() << BrkFlags::IrqBit) & ~r.p) |                      \
         (config.is_nmi() << BrkFlags::NmiBit))
 
-// TAWNY_FETCH_OPCODE_BODY — the single shared FETCH case. brk_flags carries
-// the previous instruction's poll result; if non-zero, dispatch BRK (and
-// don't poll again — interrupt sequences don't poll). Otherwise poll first,
-// then read the opcode, shift it into a step-0 tstate, set up the operand-
-// fetch address, and break out so the loop re-enters the switch at the new
-// tstate.
+// TAWNY_FETCH_OPCODE_BODY — the single shared FETCH body. Lives OUTSIDE the
+// switch (just above the `dispatch:` label), so after STEP_TAIL ticks the
+// FETCH cycle, control falls straight through to the switch dispatch on the
+// new tstate — no break, no loop test.
 //
 // Reached two ways: (a) every TAWNY_NEXT_OPCODE_FETCH gotos `fetch_opcode:`
-// directly (avoids the round trip through the switch dispatch), and (b)
-// after a horizon-hit exit-and-resume, run_until's switch dispatches case
-// 0x7FF, whose body is this same code via fall-through to the label.
+// directly from each instruction's last body step, and (b) on entry to
+// run_until, when the saved tstate is 0x7FF (set by set_pc() or by
+// horizon-hit during a previous fetch), the dispatch prologue gotos here.
+//
+// brk_flags carries the previous instruction's poll result; if non-zero we
+// dispatch BRK (don't poll again — interrupt sequences don't poll).
+// Otherwise poll first, then read the opcode, shift it into a step-0 tstate,
+// set up the operand-fetch address, and tick the cycle.
 #define TAWNY_FETCH_OPCODE_BODY                                               \
-    case 0x7FFu:                                                              \
     fetch_opcode:                                                             \
         if (!brk_flags) {                                                     \
             TAWNY_POLL;                                                       \
@@ -405,8 +407,7 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
             tst  = 0;                                                         \
         }                                                                     \
         addr = pc;                                                            \
-        TAWNY_STEP_TAIL(access_cost(addr), tst);                              \
-        break
+        TAWNY_STEP_TAIL(access_cost(addr), tst)
 
 // IMPLIED(OPCODE, OP_CLASS) — 2 cycles. Step 0 is a discarded operand-fetch
 // read; pc is NOT incremented (implied ops consume no bytes after the opcode).
@@ -1291,15 +1292,16 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }
 
 // JAM — halts the CPU on an illegal opcode by redirecting the next phi2 back
-// to the same opcode, which the Dormann trap detection catches. Simple stub.
+// to the same opcode, which the Dormann trap detection catches. After the
+// step ticks one cycle, `goto fetch_opcode` re-reads the JAM byte at PC and
+// dispatches back to this same case; access_cost_opcode's "same address as
+// last fetch" trap fires on the second iteration and stops the timeslice.
 #define TAWNY_JAM(OPCODE)                                                     \
     case ((OPCODE) << 3) | 0: {                                               \
-        /* Leave addr pointing at the JAM opcode — next opcode fetch will     \
-           hit the same address, triggering the trap or at least spinning. */ \
         pc = static_cast<std::uint16_t>(pc - 1);                              \
         addr = pc;                                                            \
         TAWNY_STEP_TAIL(access_cost_opcode(addr), ((OPCODE) << 3) | 0);       \
-        break;                                                                \
+        goto fetch_opcode;                                                    \
     }
 
 // BRK(OPCODE) — 7 cycles. Handles software BRK, reset, IRQ, and NMI through a
@@ -1539,296 +1541,298 @@ struct M6502 {
         // fields in place — one aggregate, no pack/unpack at call sites.
         auto r       = detail::Registers{this->a, this->x, this->y, this->s, this->p};
 
-        while (current < horizon) {
-            switch (tst) {
-                // Full NMOS 6502 opcode table, laid out in opcode order. * marks
-                // illegal-but-stable ops; ! marks illegal-unstable (stubbed as
-                // JAM here — implementation would need CPU-specific magic
-                // constants). The stable-illegal RMW ops (SLO/RLA/SRE/RRA/DCP/ISC)
-                // are implemented only in their zp/zpx/abs/abx forms for now;
-                // the aby/izx/izy variants stub as JAM pending ABY_RMW/IZX_RMW/
-                // IZY_RMW macros.
-                // Legal opcodes, sorted by frequency (Table 3 in
-                // Hansotten's 6502 opcode analysis of a PET BASIC
-                // sample). Opcodes with no frequency data follow in
-                // numeric order.
-                TAWNY_JSR       (0x20)                       // JSR abs (freq 684)
-                TAWNY_ZP_WRITE  (0x85, detail::Sta)          // STA zp (freq 511)
-                TAWNY_ZP_READ   (0xA5, detail::Lda)          // LDA zp (freq 437)
-                TAWNY_REL_BRANCH(0xD0, detail::BneCond)      // BNE (freq 388)
-                TAWNY_IMM_READ  (0xA9, detail::Lda)          // LDA # (freq 320)
-                TAWNY_REL_BRANCH(0xF0, detail::BeqCond)      // BEQ (freq 267)
-                TAWNY_ABS_JUMP  (0x4C)                       // JMP abs (freq 221)
-                TAWNY_IMM_READ  (0xA0, detail::Ldy)          // LDY # (freq 197)
-                TAWNY_IMM_READ  (0xC9, detail::Cmp)          // CMP # (freq 154)
-                TAWNY_PULL      (0x68, detail::Pla)          // PLA (freq 144)
-                TAWNY_RTS       (0x60)                       // RTS (freq 136)
-                TAWNY_ZP_WRITE  (0x84, detail::Sty)          // STY zp (freq 135)
-                TAWNY_PUSH      (0x48, detail::Pha)          // PHA (freq 127)
-                TAWNY_REL_BRANCH(0x90, detail::BccCond)      // BCC (freq 127)
-                TAWNY_IMPLIED   (0xC8, detail::Iny)          // INY (freq 121)
-                TAWNY_ZP_WRITE  (0x86, detail::Stx)          // STX zp (freq 116)
-                TAWNY_IMM_READ  (0xA2, detail::Ldx)          // LDX # (freq 110)
-                TAWNY_IZY_READ  (0xB1, detail::Lda)          // LDA (zp),Y (freq 109)
-                TAWNY_ZP_READ   (0xA4, detail::Ldy)          // LDY zp (freq 96)
-                TAWNY_ZP_READ   (0xA6, detail::Ldx)          // LDX zp (freq 92)
-                TAWNY_REL_BRANCH(0x10, detail::BplCond)      // BPL (freq 75)
-                TAWNY_ABS_WRITE (0x8D, detail::Sta)          // STA abs (freq 73)
-                TAWNY_IZY_WRITE (0x91, detail::Sta)          // STA (zp),Y (freq 72)
-                TAWNY_ZPX_WRITE (0x94, detail::Sty)          // STY zp,X (freq 72)
-                TAWNY_ZP_RMW    (0xE6, detail::Inc)          // INC zp (freq 72)
-                TAWNY_REL_BRANCH(0xB0, detail::BcsCond)      // BCS (freq 67)
-                TAWNY_IMPLIED   (0xAA, detail::Tax)          // TAX (freq 60)
-                TAWNY_IMPLIED   (0x18, detail::Clc)          // CLC (freq 56)
-                TAWNY_ZP_READ   (0x65, detail::Adc)          // ADC zp (freq 55)
-                TAWNY_IMM_READ  (0x69, detail::Adc)          // ADC # (freq 55)
-                TAWNY_REL_BRANCH(0x30, detail::BmiCond)      // BMI (freq 54)
-                TAWNY_IMPLIED   (0xE8, detail::Inx)          // INX (freq 49)
-                TAWNY_IMPLIED   (0x88, detail::Dey)          // DEY (freq 48)
-                TAWNY_IMPLIED   (0x8A, detail::Txa)          // TXA (freq 48)
-                TAWNY_ZP_RMW    (0xC6, detail::Dec)          // DEC zp (freq 48)
-                TAWNY_IMPLIED   (0x98, detail::Tya)          // TYA (freq 46)
-                TAWNY_IMPLIED   (0xA8, detail::Tay)          // TAY (freq 45)
-                TAWNY_ZP_READ   (0xC5, detail::Cmp)          // CMP zp (freq 43)
-                TAWNY_IMPLIED   (0xCA, detail::Dex)          // DEX (freq 43)
-                TAWNY_IMM_READ  (0x29, detail::And)          // AND # (freq 40)
-                TAWNY_IMPLIED   (0x38, detail::Sec)          // SEC (freq 40)
-                TAWNY_ABS_READ  (0xAD, detail::Lda)          // LDA abs (freq 38)
-                TAWNY_IMM_READ  (0x49, detail::Eor)          // EOR # (freq 37)
-                TAWNY_ABX_READ  (0xBD, detail::Lda)          // LDA abs,X (freq 35)
-                TAWNY_IMM_READ  (0x09, detail::Ora)          // ORA # (freq 31)
-                TAWNY_ZP_READ   (0xE5, detail::Sbc)          // SBC zp (freq 30)
-                TAWNY_ZP_READ   (0x45, detail::Eor)          // EOR zp (freq 19)
-                TAWNY_ACC_RMW   (0x4A, detail::Lsr)          // LSR A (freq 19)
-                TAWNY_IMM_READ  (0xC0, detail::Cpy)          // CPY # (freq 17)
-                TAWNY_IZY_READ  (0xD1, detail::Cmp)          // CMP (zp),Y (freq 17)
-                TAWNY_ZP_READ   (0xE4, detail::Cpx)          // CPX zp (freq 17)
-                TAWNY_ZP_RMW    (0x46, detail::Lsr)          // LSR zp (freq 14)
-                TAWNY_IMPLIED   (0xEA, detail::Nop)          // NOP (freq 14)
-                TAWNY_IMPLIED   (0x58, detail::Cli)          // CLI (freq 13)
-                TAWNY_ACC_RMW   (0x2A, detail::Rol)          // ROL A (freq 12)
-                TAWNY_IMPLIED   (0x78, detail::Sei)          // SEI (freq 12)
-                TAWNY_ZP_READ   (0x05, detail::Ora)          // ORA zp (freq 11)
-                TAWNY_ZP_RMW    (0x26, detail::Rol)          // ROL zp (freq 11)
-                TAWNY_PULL      (0x28, detail::Plp)          // PLP (freq 10)
-                TAWNY_IMPLIED   (0x9A, detail::Txs)          // TXS (freq 9)
-                TAWNY_ZP_RMW    (0x06, detail::Asl)          // ASL zp (freq 8)
-                TAWNY_ZP_READ   (0x25, detail::And)          // AND zp (freq 8)
-                TAWNY_REL_BRANCH(0x50, detail::BvcCond)      // BVC (freq 8)
-                TAWNY_ZPX_READ  (0xB4, detail::Ldy)          // LDY zp,X (freq 8)
-                TAWNY_ABS_WRITE (0x8E, detail::Stx)          // STX abs (freq 7)
-                TAWNY_IMPLIED   (0xBA, detail::Tsx)          // TSX (freq 7)
-                TAWNY_ABX_READ  (0xDD, detail::Cmp)          // CMP abs,X (freq 7)
-                TAWNY_JMP_IND   (0x6C)                       // JMP (ind) (freq 6)
-                TAWNY_REL_BRANCH(0x70, detail::BvsCond)      // BVS (freq 6)
-                TAWNY_ZPX_RMW   (0x76, detail::Ror)          // ROR zp,X (freq 5)
-                TAWNY_ABY_READ  (0x79, detail::Adc)          // ADC abs,Y (freq 4)
-                TAWNY_ABS_READ  (0xAE, detail::Ldx)          // LDX abs (freq 4)
-                TAWNY_ZPX_READ  (0xF5, detail::Sbc)          // SBC zp,X (freq 4)
-                TAWNY_ABS_WRITE (0x8C, detail::Sty)          // STY abs (freq 3)
-                TAWNY_ABS_READ  (0xCD, detail::Cmp)          // CMP abs (freq 3)
-                TAWNY_IZY_READ  (0xF1, detail::Sbc)          // SBC (zp),Y (freq 3)
-                TAWNY_ZPX_RMW   (0x16, detail::Asl)          // ASL zp,X (freq 2)
-                TAWNY_RTI       (0x40)                       // RTI (freq 2)
-                TAWNY_ZPX_RMW   (0x56, detail::Lsr)          // LSR zp,X (freq 2)
-                TAWNY_IZY_READ  (0x71, detail::Adc)          // ADC (zp),Y (freq 2)
-                TAWNY_ABS_READ  (0xAC, detail::Ldy)          // LDY abs (freq 2)
-                TAWNY_IMPLIED   (0xD8, detail::Cld)          // CLD (freq 2)
-                TAWNY_ABY_READ  (0xD9, detail::Cmp)          // CMP abs,Y (freq 2)
-                TAWNY_ABS_RMW   (0xEE, detail::Inc)          // INC abs (freq 2)
-                TAWNY_ZPX_RMW   (0xF6, detail::Inc)          // INC zp,X (freq 2)
-                TAWNY_ABY_READ  (0xF9, detail::Sbc)          // SBC abs,Y (freq 1)
-                TAWNY_ABX_READ  (0xFD, detail::Sbc)          // SBC abs,X (freq 1)
-                TAWNY_BRK       (0x00)                       // BRK
-                TAWNY_IZX_READ  (0x01, detail::Ora)          // ORA (zp,X)
-                TAWNY_PUSH      (0x08, detail::Php)          // PHP
-                TAWNY_ACC_RMW   (0x0A, detail::Asl)          // ASL A
-                TAWNY_ABS_READ  (0x0D, detail::Ora)          // ORA abs
-                TAWNY_ABS_RMW   (0x0E, detail::Asl)          // ASL abs
-                TAWNY_IZY_READ  (0x11, detail::Ora)          // ORA (zp),Y
-                TAWNY_ZPX_READ  (0x15, detail::Ora)          // ORA zp,X
-                TAWNY_ABY_READ  (0x19, detail::Ora)          // ORA abs,Y
-                TAWNY_ABX_READ  (0x1D, detail::Ora)          // ORA abs,X
-                TAWNY_ABX_RMW   (0x1E, detail::Asl)          // ASL abs,X
-                TAWNY_IZX_READ  (0x21, detail::And)          // AND (zp,X)
-                TAWNY_ZP_READ   (0x24, detail::Bit)          // BIT zp
-                TAWNY_ABS_READ  (0x2C, detail::Bit)          // BIT abs
-                TAWNY_ABS_READ  (0x2D, detail::And)          // AND abs
-                TAWNY_ABS_RMW   (0x2E, detail::Rol)          // ROL abs
-                TAWNY_IZY_READ  (0x31, detail::And)          // AND (zp),Y
-                TAWNY_ZPX_READ  (0x35, detail::And)          // AND zp,X
-                TAWNY_ZPX_RMW   (0x36, detail::Rol)          // ROL zp,X
-                TAWNY_ABY_READ  (0x39, detail::And)          // AND abs,Y
-                TAWNY_ABX_READ  (0x3D, detail::And)          // AND abs,X
-                TAWNY_ABX_RMW   (0x3E, detail::Rol)          // ROL abs,X
-                TAWNY_IZX_READ  (0x41, detail::Eor)          // EOR (zp,X)
-                TAWNY_ABS_READ  (0x4D, detail::Eor)          // EOR abs
-                TAWNY_ABS_RMW   (0x4E, detail::Lsr)          // LSR abs
-                TAWNY_IZY_READ  (0x51, detail::Eor)          // EOR (zp),Y
-                TAWNY_ZPX_READ  (0x55, detail::Eor)          // EOR zp,X
-                TAWNY_ABY_READ  (0x59, detail::Eor)          // EOR abs,Y
-                TAWNY_ABX_READ  (0x5D, detail::Eor)          // EOR abs,X
-                TAWNY_ABX_RMW   (0x5E, detail::Lsr)          // LSR abs,X
-                TAWNY_IZX_READ  (0x61, detail::Adc)          // ADC (zp,X)
-                TAWNY_ZP_RMW    (0x66, detail::Ror)          // ROR zp
-                TAWNY_ACC_RMW   (0x6A, detail::Ror)          // ROR A
-                TAWNY_ABS_READ  (0x6D, detail::Adc)          // ADC abs
-                TAWNY_ABS_RMW   (0x6E, detail::Ror)          // ROR abs
-                TAWNY_ZPX_READ  (0x75, detail::Adc)          // ADC zp,X
-                TAWNY_ABX_READ  (0x7D, detail::Adc)          // ADC abs,X
-                TAWNY_ABX_RMW   (0x7E, detail::Ror)          // ROR abs,X
-                TAWNY_IZX_WRITE (0x81, detail::Sta)          // STA (zp,X)
-                TAWNY_ZPX_WRITE (0x95, detail::Sta)          // STA zp,X
-                TAWNY_ZPY_WRITE (0x96, detail::Stx)          // STX zp,Y
-                TAWNY_ABY_WRITE (0x99, detail::Sta)          // STA abs,Y
-                TAWNY_ABX_WRITE (0x9D, detail::Sta)          // STA abs,X
-                TAWNY_IZX_READ  (0xA1, detail::Lda)          // LDA (zp,X)
-                TAWNY_ZPX_READ  (0xB5, detail::Lda)          // LDA zp,X
-                TAWNY_ZPY_READ  (0xB6, detail::Ldx)          // LDX zp,Y
-                TAWNY_IMPLIED   (0xB8, detail::Clv)          // CLV
-                TAWNY_ABY_READ  (0xB9, detail::Lda)          // LDA abs,Y
-                TAWNY_ABX_READ  (0xBC, detail::Ldy)          // LDY abs,X
-                TAWNY_ABY_READ  (0xBE, detail::Ldx)          // LDX abs,Y
-                TAWNY_IZX_READ  (0xC1, detail::Cmp)          // CMP (zp,X)
-                TAWNY_ZP_READ   (0xC4, detail::Cpy)          // CPY zp
-                TAWNY_ABS_READ  (0xCC, detail::Cpy)          // CPY abs
-                TAWNY_ABS_RMW   (0xCE, detail::Dec)          // DEC abs
-                TAWNY_ZPX_READ  (0xD5, detail::Cmp)          // CMP zp,X
-                TAWNY_ZPX_RMW   (0xD6, detail::Dec)          // DEC zp,X
-                TAWNY_ABX_RMW   (0xDE, detail::Dec)          // DEC abs,X
-                TAWNY_IMM_READ  (0xE0, detail::Cpx)          // CPX #
-                TAWNY_IZX_READ  (0xE1, detail::Sbc)          // SBC (zp,X)
-                TAWNY_IMM_READ  (0xE9, detail::Sbc)          // SBC #
-                TAWNY_ABS_READ  (0xEC, detail::Cpx)          // CPX abs
-                TAWNY_ABS_READ  (0xED, detail::Sbc)          // SBC abs
-                TAWNY_IMPLIED   (0xF8, detail::Sed)          // SED
-                TAWNY_ABX_RMW   (0xFE, detail::Inc)          // INC abs,X
+        // No while loop — explicit goto control flow. On entry, dispatch into
+        // the FETCH body if the saved tstate is 0x7FF (set_pc bootstrap, or
+        // horizon-hit during a previous fetch), otherwise fall straight to
+        // the switch and resume mid-instruction. Each instruction's last
+        // body step gotos `fetch_opcode:`, which lives inside the if block
+        // below; after the FETCH body ticks, control falls out of the if
+        // block and into the switch dispatch on the new tstate. Horizon
+        // checks live inside STEP_TAIL — no per-iteration loop test.
+        if (current >= horizon) goto exit;
 
-                // Shared opcode-fetch body at tstate 0x7FF. Every instruction's
-                // last step ticks one cycle (via TAWNY_NEXT_OPCODE_FETCH) and
-                // then `goto fetch_opcode` jumps directly here. set_pc() also
-                // seeds tstate=0x7FF so the first dispatch lands here. The
-                // 0x7FF slot is free because real dispatch only produces
-                // tstates up to (opcode<<3 | step) where step<=6 (longest
-                // instruction is 8 cycles, steps 0-6 plus the FETCH that's
-                // now coalesced).
-                TAWNY_FETCH_OPCODE_BODY;
+        if (tst == 0x7FFu) {
+            TAWNY_FETCH_OPCODE_BODY;
+        }
 
-                // Illegal opcodes (JAM stubs + stable illegals) in numeric order.
-                TAWNY_JAM       (0x02)                       // JAM*
-                TAWNY_IZX_RMW   (0x03, detail::Slo)          // SLO (zp,X)*
-                TAWNY_ZP_READ   (0x04, detail::Nop)          // NOP zp*
-                TAWNY_ZP_RMW    (0x07, detail::Slo)          // SLO zp*
-                TAWNY_IMM_READ  (0x0B, detail::Anc)          // ANC #*
-                TAWNY_ABS_READ  (0x0C, detail::Nop)          // NOP abs*
-                TAWNY_ABS_RMW   (0x0F, detail::Slo)          // SLO abs*
-                TAWNY_JAM       (0x12)                       // JAM*
-                TAWNY_IZY_RMW   (0x13, detail::Slo)          // SLO (zp),Y*
-                TAWNY_ZPX_READ  (0x14, detail::Nop)          // NOP zp,X*
-                TAWNY_ZPX_RMW   (0x17, detail::Slo)          // SLO zp,X*
-                TAWNY_IMPLIED   (0x1A, detail::Nop)          // NOP*
-                TAWNY_ABY_RMW   (0x1B, detail::Slo)          // SLO abs,Y*
-                TAWNY_ABX_READ  (0x1C, detail::Nop)          // NOP abs,X*
-                TAWNY_ABX_RMW   (0x1F, detail::Slo)          // SLO abs,X*
-                TAWNY_JAM       (0x22)                       // JAM*
-                TAWNY_IZX_RMW   (0x23, detail::Rla)          // RLA (zp,X)*
-                TAWNY_ZP_RMW    (0x27, detail::Rla)          // RLA zp*
-                TAWNY_IMM_READ  (0x2B, detail::Anc)          // ANC #*
-                TAWNY_ABS_RMW   (0x2F, detail::Rla)          // RLA abs*
-                TAWNY_JAM       (0x32)                       // JAM*
-                TAWNY_IZY_RMW   (0x33, detail::Rla)          // RLA (zp),Y*
-                TAWNY_ZPX_READ  (0x34, detail::Nop)          // NOP zp,X*
-                TAWNY_ZPX_RMW   (0x37, detail::Rla)          // RLA zp,X*
-                TAWNY_IMPLIED   (0x3A, detail::Nop)          // NOP*
-                TAWNY_ABY_RMW   (0x3B, detail::Rla)          // RLA abs,Y*
-                TAWNY_ABX_READ  (0x3C, detail::Nop)          // NOP abs,X*
-                TAWNY_ABX_RMW   (0x3F, detail::Rla)          // RLA abs,X*
-                TAWNY_JAM       (0x42)                       // JAM*
-                TAWNY_IZX_RMW   (0x43, detail::Sre)          // SRE (zp,X)*
-                TAWNY_ZP_READ   (0x44, detail::Nop)          // NOP zp*
-                TAWNY_ZP_RMW    (0x47, detail::Sre)          // SRE zp*
-                TAWNY_IMM_READ  (0x4B, detail::Alr)          // ALR #*
-                TAWNY_ABS_RMW   (0x4F, detail::Sre)          // SRE abs*
-                TAWNY_JAM       (0x52)                       // JAM*
-                TAWNY_IZY_RMW   (0x53, detail::Sre)          // SRE (zp),Y*
-                TAWNY_ZPX_READ  (0x54, detail::Nop)          // NOP zp,X*
-                TAWNY_ZPX_RMW   (0x57, detail::Sre)          // SRE zp,X*
-                TAWNY_IMPLIED   (0x5A, detail::Nop)          // NOP*
-                TAWNY_ABY_RMW   (0x5B, detail::Sre)          // SRE abs,Y*
-                TAWNY_ABX_READ  (0x5C, detail::Nop)          // NOP abs,X*
-                TAWNY_ABX_RMW   (0x5F, detail::Sre)          // SRE abs,X*
-                TAWNY_JAM       (0x62)                       // JAM*
-                TAWNY_IZX_RMW   (0x63, detail::Rra)          // RRA (zp,X)*
-                TAWNY_ZP_READ   (0x64, detail::Nop)          // NOP zp*
-                TAWNY_ZP_RMW    (0x67, detail::Rra)          // RRA zp*
-                TAWNY_IMM_READ  (0x6B, detail::Arr)          // ARR #*
-                TAWNY_ABS_RMW   (0x6F, detail::Rra)          // RRA abs*
-                TAWNY_JAM       (0x72)                       // JAM*
-                TAWNY_IZY_RMW   (0x73, detail::Rra)          // RRA (zp),Y*
-                TAWNY_ZPX_READ  (0x74, detail::Nop)          // NOP zp,X*
-                TAWNY_ZPX_RMW   (0x77, detail::Rra)          // RRA zp,X*
-                TAWNY_IMPLIED   (0x7A, detail::Nop)          // NOP*
-                TAWNY_ABY_RMW   (0x7B, detail::Rra)          // RRA abs,Y*
-                TAWNY_ABX_READ  (0x7C, detail::Nop)          // NOP abs,X*
-                TAWNY_ABX_RMW   (0x7F, detail::Rra)          // RRA abs,X*
-                TAWNY_IMM_READ  (0x80, detail::Nop)          // NOP #*
-                TAWNY_IMM_READ  (0x82, detail::Nop)          // NOP #*
-                TAWNY_IZX_WRITE (0x83, detail::Sax)          // SAX (zp,X)*
-                TAWNY_ZP_WRITE  (0x87, detail::Sax)          // SAX zp*
-                TAWNY_IMM_READ  (0x89, detail::Nop)          // NOP #*
-                TAWNY_IMM_READ  (0x8B, detail::Ane)          // ANE #! (unstable)
-                TAWNY_ABS_WRITE (0x8F, detail::Sax)          // SAX abs*
-                TAWNY_JAM       (0x92)                       // JAM*
-                TAWNY_JAM       (0x93)                       // SHA (zp),Y!
-                TAWNY_ZPY_WRITE (0x97, detail::Sax)          // SAX zp,Y*
-                TAWNY_JAM       (0x9B)                       // TAS abs,Y!
-                TAWNY_JAM       (0x9C)                       // SHY abs,X!
-                TAWNY_JAM       (0x9E)                       // SHX abs,Y!
-                TAWNY_JAM       (0x9F)                       // SHA abs,Y!
-                TAWNY_IZX_READ  (0xA3, detail::Lax)          // LAX (zp,X)*
-                TAWNY_ZP_READ   (0xA7, detail::Lax)          // LAX zp*
-                TAWNY_IMM_READ  (0xAB, detail::Lxa)          // LXA #! (unstable)
-                TAWNY_ABS_READ  (0xAF, detail::Lax)          // LAX abs*
-                TAWNY_JAM       (0xB2)                       // JAM*
-                TAWNY_IZY_READ  (0xB3, detail::Lax)          // LAX (zp),Y*
-                TAWNY_ZPY_READ  (0xB7, detail::Lax)          // LAX zp,Y*
-                TAWNY_ABY_READ  (0xBB, detail::Las)          // LAS abs,Y! (unstable)
-                TAWNY_ABY_READ  (0xBF, detail::Lax)          // LAX abs,Y*
-                TAWNY_IMM_READ  (0xC2, detail::Nop)          // NOP #*
-                TAWNY_IZX_RMW   (0xC3, detail::Dcp)          // DCP (zp,X)*
-                TAWNY_ZP_RMW    (0xC7, detail::Dcp)          // DCP zp*
-                TAWNY_IMM_READ  (0xCB, detail::Axs)          // AXS #*
-                TAWNY_ABS_RMW   (0xCF, detail::Dcp)          // DCP abs*
-                TAWNY_JAM       (0xD2)                       // JAM*
-                TAWNY_IZY_RMW   (0xD3, detail::Dcp)          // DCP (zp),Y*
-                TAWNY_ZPX_READ  (0xD4, detail::Nop)          // NOP zp,X*
-                TAWNY_ZPX_RMW   (0xD7, detail::Dcp)          // DCP zp,X*
-                TAWNY_IMPLIED   (0xDA, detail::Nop)          // NOP*
-                TAWNY_ABY_RMW   (0xDB, detail::Dcp)          // DCP abs,Y*
-                TAWNY_ABX_READ  (0xDC, detail::Nop)          // NOP abs,X*
-                TAWNY_ABX_RMW   (0xDF, detail::Dcp)          // DCP abs,X*
-                TAWNY_IMM_READ  (0xE2, detail::Nop)          // NOP #*
-                TAWNY_IZX_RMW   (0xE3, detail::Isc)          // ISC (zp,X)*
-                TAWNY_ZP_RMW    (0xE7, detail::Isc)          // ISC zp*
-                TAWNY_IMM_READ  (0xEB, detail::Usbc)         // USBC #*
-                TAWNY_ABS_RMW   (0xEF, detail::Isc)          // ISC abs*
-                TAWNY_JAM       (0xF2)                       // JAM*
-                TAWNY_IZY_RMW   (0xF3, detail::Isc)          // ISC (zp),Y*
-                TAWNY_ZPX_READ  (0xF4, detail::Nop)          // NOP zp,X*
-                TAWNY_ZPX_RMW   (0xF7, detail::Isc)          // ISC zp,X*
-                TAWNY_IMPLIED   (0xFA, detail::Nop)          // NOP*
-                TAWNY_ABY_RMW   (0xFB, detail::Isc)          // ISC abs,Y*
-                TAWNY_ABX_READ  (0xFC, detail::Nop)          // NOP abs,X*
-                TAWNY_ABX_RMW   (0xFF, detail::Isc)          // ISC abs,X*
+        switch (tst) {
+            // Full NMOS 6502 opcode table, laid out in opcode order. * marks
+            // illegal-but-stable ops; ! marks illegal-unstable (stubbed as
+            // JAM here — implementation would need CPU-specific magic
+            // constants). The stable-illegal RMW ops (SLO/RLA/SRE/RRA/DCP/ISC)
+            // are implemented only in their zp/zpx/abs/abx forms for now;
+            // the aby/izx/izy variants stub as JAM pending ABY_RMW/IZX_RMW/
+            // IZY_RMW macros.
+            // Legal opcodes, sorted by frequency (Table 3 in
+            // Hansotten's 6502 opcode analysis of a PET BASIC
+            // sample). Opcodes with no frequency data follow in
+            // numeric order.
+            TAWNY_JSR       (0x20)                       // JSR abs (freq 684)
+            TAWNY_ZP_WRITE  (0x85, detail::Sta)          // STA zp (freq 511)
+            TAWNY_ZP_READ   (0xA5, detail::Lda)          // LDA zp (freq 437)
+            TAWNY_REL_BRANCH(0xD0, detail::BneCond)      // BNE (freq 388)
+            TAWNY_IMM_READ  (0xA9, detail::Lda)          // LDA # (freq 320)
+            TAWNY_REL_BRANCH(0xF0, detail::BeqCond)      // BEQ (freq 267)
+            TAWNY_ABS_JUMP  (0x4C)                       // JMP abs (freq 221)
+            TAWNY_IMM_READ  (0xA0, detail::Ldy)          // LDY # (freq 197)
+            TAWNY_IMM_READ  (0xC9, detail::Cmp)          // CMP # (freq 154)
+            TAWNY_PULL      (0x68, detail::Pla)          // PLA (freq 144)
+            TAWNY_RTS       (0x60)                       // RTS (freq 136)
+            TAWNY_ZP_WRITE  (0x84, detail::Sty)          // STY zp (freq 135)
+            TAWNY_PUSH      (0x48, detail::Pha)          // PHA (freq 127)
+            TAWNY_REL_BRANCH(0x90, detail::BccCond)      // BCC (freq 127)
+            TAWNY_IMPLIED   (0xC8, detail::Iny)          // INY (freq 121)
+            TAWNY_ZP_WRITE  (0x86, detail::Stx)          // STX zp (freq 116)
+            TAWNY_IMM_READ  (0xA2, detail::Ldx)          // LDX # (freq 110)
+            TAWNY_IZY_READ  (0xB1, detail::Lda)          // LDA (zp),Y (freq 109)
+            TAWNY_ZP_READ   (0xA4, detail::Ldy)          // LDY zp (freq 96)
+            TAWNY_ZP_READ   (0xA6, detail::Ldx)          // LDX zp (freq 92)
+            TAWNY_REL_BRANCH(0x10, detail::BplCond)      // BPL (freq 75)
+            TAWNY_ABS_WRITE (0x8D, detail::Sta)          // STA abs (freq 73)
+            TAWNY_IZY_WRITE (0x91, detail::Sta)          // STA (zp),Y (freq 72)
+            TAWNY_ZPX_WRITE (0x94, detail::Sty)          // STY zp,X (freq 72)
+            TAWNY_ZP_RMW    (0xE6, detail::Inc)          // INC zp (freq 72)
+            TAWNY_REL_BRANCH(0xB0, detail::BcsCond)      // BCS (freq 67)
+            TAWNY_IMPLIED   (0xAA, detail::Tax)          // TAX (freq 60)
+            TAWNY_IMPLIED   (0x18, detail::Clc)          // CLC (freq 56)
+            TAWNY_ZP_READ   (0x65, detail::Adc)          // ADC zp (freq 55)
+            TAWNY_IMM_READ  (0x69, detail::Adc)          // ADC # (freq 55)
+            TAWNY_REL_BRANCH(0x30, detail::BmiCond)      // BMI (freq 54)
+            TAWNY_IMPLIED   (0xE8, detail::Inx)          // INX (freq 49)
+            TAWNY_IMPLIED   (0x88, detail::Dey)          // DEY (freq 48)
+            TAWNY_IMPLIED   (0x8A, detail::Txa)          // TXA (freq 48)
+            TAWNY_ZP_RMW    (0xC6, detail::Dec)          // DEC zp (freq 48)
+            TAWNY_IMPLIED   (0x98, detail::Tya)          // TYA (freq 46)
+            TAWNY_IMPLIED   (0xA8, detail::Tay)          // TAY (freq 45)
+            TAWNY_ZP_READ   (0xC5, detail::Cmp)          // CMP zp (freq 43)
+            TAWNY_IMPLIED   (0xCA, detail::Dex)          // DEX (freq 43)
+            TAWNY_IMM_READ  (0x29, detail::And)          // AND # (freq 40)
+            TAWNY_IMPLIED   (0x38, detail::Sec)          // SEC (freq 40)
+            TAWNY_ABS_READ  (0xAD, detail::Lda)          // LDA abs (freq 38)
+            TAWNY_IMM_READ  (0x49, detail::Eor)          // EOR # (freq 37)
+            TAWNY_ABX_READ  (0xBD, detail::Lda)          // LDA abs,X (freq 35)
+            TAWNY_IMM_READ  (0x09, detail::Ora)          // ORA # (freq 31)
+            TAWNY_ZP_READ   (0xE5, detail::Sbc)          // SBC zp (freq 30)
+            TAWNY_ZP_READ   (0x45, detail::Eor)          // EOR zp (freq 19)
+            TAWNY_ACC_RMW   (0x4A, detail::Lsr)          // LSR A (freq 19)
+            TAWNY_IMM_READ  (0xC0, detail::Cpy)          // CPY # (freq 17)
+            TAWNY_IZY_READ  (0xD1, detail::Cmp)          // CMP (zp),Y (freq 17)
+            TAWNY_ZP_READ   (0xE4, detail::Cpx)          // CPX zp (freq 17)
+            TAWNY_ZP_RMW    (0x46, detail::Lsr)          // LSR zp (freq 14)
+            TAWNY_IMPLIED   (0xEA, detail::Nop)          // NOP (freq 14)
+            TAWNY_IMPLIED   (0x58, detail::Cli)          // CLI (freq 13)
+            TAWNY_ACC_RMW   (0x2A, detail::Rol)          // ROL A (freq 12)
+            TAWNY_IMPLIED   (0x78, detail::Sei)          // SEI (freq 12)
+            TAWNY_ZP_READ   (0x05, detail::Ora)          // ORA zp (freq 11)
+            TAWNY_ZP_RMW    (0x26, detail::Rol)          // ROL zp (freq 11)
+            TAWNY_PULL      (0x28, detail::Plp)          // PLP (freq 10)
+            TAWNY_IMPLIED   (0x9A, detail::Txs)          // TXS (freq 9)
+            TAWNY_ZP_RMW    (0x06, detail::Asl)          // ASL zp (freq 8)
+            TAWNY_ZP_READ   (0x25, detail::And)          // AND zp (freq 8)
+            TAWNY_REL_BRANCH(0x50, detail::BvcCond)      // BVC (freq 8)
+            TAWNY_ZPX_READ  (0xB4, detail::Ldy)          // LDY zp,X (freq 8)
+            TAWNY_ABS_WRITE (0x8E, detail::Stx)          // STX abs (freq 7)
+            TAWNY_IMPLIED   (0xBA, detail::Tsx)          // TSX (freq 7)
+            TAWNY_ABX_READ  (0xDD, detail::Cmp)          // CMP abs,X (freq 7)
+            TAWNY_JMP_IND   (0x6C)                       // JMP (ind) (freq 6)
+            TAWNY_REL_BRANCH(0x70, detail::BvsCond)      // BVS (freq 6)
+            TAWNY_ZPX_RMW   (0x76, detail::Ror)          // ROR zp,X (freq 5)
+            TAWNY_ABY_READ  (0x79, detail::Adc)          // ADC abs,Y (freq 4)
+            TAWNY_ABS_READ  (0xAE, detail::Ldx)          // LDX abs (freq 4)
+            TAWNY_ZPX_READ  (0xF5, detail::Sbc)          // SBC zp,X (freq 4)
+            TAWNY_ABS_WRITE (0x8C, detail::Sty)          // STY abs (freq 3)
+            TAWNY_ABS_READ  (0xCD, detail::Cmp)          // CMP abs (freq 3)
+            TAWNY_IZY_READ  (0xF1, detail::Sbc)          // SBC (zp),Y (freq 3)
+            TAWNY_ZPX_RMW   (0x16, detail::Asl)          // ASL zp,X (freq 2)
+            TAWNY_RTI       (0x40)                       // RTI (freq 2)
+            TAWNY_ZPX_RMW   (0x56, detail::Lsr)          // LSR zp,X (freq 2)
+            TAWNY_IZY_READ  (0x71, detail::Adc)          // ADC (zp),Y (freq 2)
+            TAWNY_ABS_READ  (0xAC, detail::Ldy)          // LDY abs (freq 2)
+            TAWNY_IMPLIED   (0xD8, detail::Cld)          // CLD (freq 2)
+            TAWNY_ABY_READ  (0xD9, detail::Cmp)          // CMP abs,Y (freq 2)
+            TAWNY_ABS_RMW   (0xEE, detail::Inc)          // INC abs (freq 2)
+            TAWNY_ZPX_RMW   (0xF6, detail::Inc)          // INC zp,X (freq 2)
+            TAWNY_ABY_READ  (0xF9, detail::Sbc)          // SBC abs,Y (freq 1)
+            TAWNY_ABX_READ  (0xFD, detail::Sbc)          // SBC abs,X (freq 1)
+            TAWNY_BRK       (0x00)                       // BRK
+            TAWNY_IZX_READ  (0x01, detail::Ora)          // ORA (zp,X)
+            TAWNY_PUSH      (0x08, detail::Php)          // PHP
+            TAWNY_ACC_RMW   (0x0A, detail::Asl)          // ASL A
+            TAWNY_ABS_READ  (0x0D, detail::Ora)          // ORA abs
+            TAWNY_ABS_RMW   (0x0E, detail::Asl)          // ASL abs
+            TAWNY_IZY_READ  (0x11, detail::Ora)          // ORA (zp),Y
+            TAWNY_ZPX_READ  (0x15, detail::Ora)          // ORA zp,X
+            TAWNY_ABY_READ  (0x19, detail::Ora)          // ORA abs,Y
+            TAWNY_ABX_READ  (0x1D, detail::Ora)          // ORA abs,X
+            TAWNY_ABX_RMW   (0x1E, detail::Asl)          // ASL abs,X
+            TAWNY_IZX_READ  (0x21, detail::And)          // AND (zp,X)
+            TAWNY_ZP_READ   (0x24, detail::Bit)          // BIT zp
+            TAWNY_ABS_READ  (0x2C, detail::Bit)          // BIT abs
+            TAWNY_ABS_READ  (0x2D, detail::And)          // AND abs
+            TAWNY_ABS_RMW   (0x2E, detail::Rol)          // ROL abs
+            TAWNY_IZY_READ  (0x31, detail::And)          // AND (zp),Y
+            TAWNY_ZPX_READ  (0x35, detail::And)          // AND zp,X
+            TAWNY_ZPX_RMW   (0x36, detail::Rol)          // ROL zp,X
+            TAWNY_ABY_READ  (0x39, detail::And)          // AND abs,Y
+            TAWNY_ABX_READ  (0x3D, detail::And)          // AND abs,X
+            TAWNY_ABX_RMW   (0x3E, detail::Rol)          // ROL abs,X
+            TAWNY_IZX_READ  (0x41, detail::Eor)          // EOR (zp,X)
+            TAWNY_ABS_READ  (0x4D, detail::Eor)          // EOR abs
+            TAWNY_ABS_RMW   (0x4E, detail::Lsr)          // LSR abs
+            TAWNY_IZY_READ  (0x51, detail::Eor)          // EOR (zp),Y
+            TAWNY_ZPX_READ  (0x55, detail::Eor)          // EOR zp,X
+            TAWNY_ABY_READ  (0x59, detail::Eor)          // EOR abs,Y
+            TAWNY_ABX_READ  (0x5D, detail::Eor)          // EOR abs,X
+            TAWNY_ABX_RMW   (0x5E, detail::Lsr)          // LSR abs,X
+            TAWNY_IZX_READ  (0x61, detail::Adc)          // ADC (zp,X)
+            TAWNY_ZP_RMW    (0x66, detail::Ror)          // ROR zp
+            TAWNY_ACC_RMW   (0x6A, detail::Ror)          // ROR A
+            TAWNY_ABS_READ  (0x6D, detail::Adc)          // ADC abs
+            TAWNY_ABS_RMW   (0x6E, detail::Ror)          // ROR abs
+            TAWNY_ZPX_READ  (0x75, detail::Adc)          // ADC zp,X
+            TAWNY_ABX_READ  (0x7D, detail::Adc)          // ADC abs,X
+            TAWNY_ABX_RMW   (0x7E, detail::Ror)          // ROR abs,X
+            TAWNY_IZX_WRITE (0x81, detail::Sta)          // STA (zp,X)
+            TAWNY_ZPX_WRITE (0x95, detail::Sta)          // STA zp,X
+            TAWNY_ZPY_WRITE (0x96, detail::Stx)          // STX zp,Y
+            TAWNY_ABY_WRITE (0x99, detail::Sta)          // STA abs,Y
+            TAWNY_ABX_WRITE (0x9D, detail::Sta)          // STA abs,X
+            TAWNY_IZX_READ  (0xA1, detail::Lda)          // LDA (zp,X)
+            TAWNY_ZPX_READ  (0xB5, detail::Lda)          // LDA zp,X
+            TAWNY_ZPY_READ  (0xB6, detail::Ldx)          // LDX zp,Y
+            TAWNY_IMPLIED   (0xB8, detail::Clv)          // CLV
+            TAWNY_ABY_READ  (0xB9, detail::Lda)          // LDA abs,Y
+            TAWNY_ABX_READ  (0xBC, detail::Ldy)          // LDY abs,X
+            TAWNY_ABY_READ  (0xBE, detail::Ldx)          // LDX abs,Y
+            TAWNY_IZX_READ  (0xC1, detail::Cmp)          // CMP (zp,X)
+            TAWNY_ZP_READ   (0xC4, detail::Cpy)          // CPY zp
+            TAWNY_ABS_READ  (0xCC, detail::Cpy)          // CPY abs
+            TAWNY_ABS_RMW   (0xCE, detail::Dec)          // DEC abs
+            TAWNY_ZPX_READ  (0xD5, detail::Cmp)          // CMP zp,X
+            TAWNY_ZPX_RMW   (0xD6, detail::Dec)          // DEC zp,X
+            TAWNY_ABX_RMW   (0xDE, detail::Dec)          // DEC abs,X
+            TAWNY_IMM_READ  (0xE0, detail::Cpx)          // CPX #
+            TAWNY_IZX_READ  (0xE1, detail::Sbc)          // SBC (zp,X)
+            TAWNY_IMM_READ  (0xE9, detail::Sbc)          // SBC #
+            TAWNY_ABS_READ  (0xEC, detail::Cpx)          // CPX abs
+            TAWNY_ABS_READ  (0xED, detail::Sbc)          // SBC abs
+            TAWNY_IMPLIED   (0xF8, detail::Sed)          // SED
+            TAWNY_ABX_RMW   (0xFE, detail::Inc)          // INC abs,X
+
+            // Illegal opcodes (JAM stubs + stable illegals) in numeric order.
+            TAWNY_JAM       (0x02)                       // JAM*
+            TAWNY_IZX_RMW   (0x03, detail::Slo)          // SLO (zp,X)*
+            TAWNY_ZP_READ   (0x04, detail::Nop)          // NOP zp*
+            TAWNY_ZP_RMW    (0x07, detail::Slo)          // SLO zp*
+            TAWNY_IMM_READ  (0x0B, detail::Anc)          // ANC #*
+            TAWNY_ABS_READ  (0x0C, detail::Nop)          // NOP abs*
+            TAWNY_ABS_RMW   (0x0F, detail::Slo)          // SLO abs*
+            TAWNY_JAM       (0x12)                       // JAM*
+            TAWNY_IZY_RMW   (0x13, detail::Slo)          // SLO (zp),Y*
+            TAWNY_ZPX_READ  (0x14, detail::Nop)          // NOP zp,X*
+            TAWNY_ZPX_RMW   (0x17, detail::Slo)          // SLO zp,X*
+            TAWNY_IMPLIED   (0x1A, detail::Nop)          // NOP*
+            TAWNY_ABY_RMW   (0x1B, detail::Slo)          // SLO abs,Y*
+            TAWNY_ABX_READ  (0x1C, detail::Nop)          // NOP abs,X*
+            TAWNY_ABX_RMW   (0x1F, detail::Slo)          // SLO abs,X*
+            TAWNY_JAM       (0x22)                       // JAM*
+            TAWNY_IZX_RMW   (0x23, detail::Rla)          // RLA (zp,X)*
+            TAWNY_ZP_RMW    (0x27, detail::Rla)          // RLA zp*
+            TAWNY_IMM_READ  (0x2B, detail::Anc)          // ANC #*
+            TAWNY_ABS_RMW   (0x2F, detail::Rla)          // RLA abs*
+            TAWNY_JAM       (0x32)                       // JAM*
+            TAWNY_IZY_RMW   (0x33, detail::Rla)          // RLA (zp),Y*
+            TAWNY_ZPX_READ  (0x34, detail::Nop)          // NOP zp,X*
+            TAWNY_ZPX_RMW   (0x37, detail::Rla)          // RLA zp,X*
+            TAWNY_IMPLIED   (0x3A, detail::Nop)          // NOP*
+            TAWNY_ABY_RMW   (0x3B, detail::Rla)          // RLA abs,Y*
+            TAWNY_ABX_READ  (0x3C, detail::Nop)          // NOP abs,X*
+            TAWNY_ABX_RMW   (0x3F, detail::Rla)          // RLA abs,X*
+            TAWNY_JAM       (0x42)                       // JAM*
+            TAWNY_IZX_RMW   (0x43, detail::Sre)          // SRE (zp,X)*
+            TAWNY_ZP_READ   (0x44, detail::Nop)          // NOP zp*
+            TAWNY_ZP_RMW    (0x47, detail::Sre)          // SRE zp*
+            TAWNY_IMM_READ  (0x4B, detail::Alr)          // ALR #*
+            TAWNY_ABS_RMW   (0x4F, detail::Sre)          // SRE abs*
+            TAWNY_JAM       (0x52)                       // JAM*
+            TAWNY_IZY_RMW   (0x53, detail::Sre)          // SRE (zp),Y*
+            TAWNY_ZPX_READ  (0x54, detail::Nop)          // NOP zp,X*
+            TAWNY_ZPX_RMW   (0x57, detail::Sre)          // SRE zp,X*
+            TAWNY_IMPLIED   (0x5A, detail::Nop)          // NOP*
+            TAWNY_ABY_RMW   (0x5B, detail::Sre)          // SRE abs,Y*
+            TAWNY_ABX_READ  (0x5C, detail::Nop)          // NOP abs,X*
+            TAWNY_ABX_RMW   (0x5F, detail::Sre)          // SRE abs,X*
+            TAWNY_JAM       (0x62)                       // JAM*
+            TAWNY_IZX_RMW   (0x63, detail::Rra)          // RRA (zp,X)*
+            TAWNY_ZP_READ   (0x64, detail::Nop)          // NOP zp*
+            TAWNY_ZP_RMW    (0x67, detail::Rra)          // RRA zp*
+            TAWNY_IMM_READ  (0x6B, detail::Arr)          // ARR #*
+            TAWNY_ABS_RMW   (0x6F, detail::Rra)          // RRA abs*
+            TAWNY_JAM       (0x72)                       // JAM*
+            TAWNY_IZY_RMW   (0x73, detail::Rra)          // RRA (zp),Y*
+            TAWNY_ZPX_READ  (0x74, detail::Nop)          // NOP zp,X*
+            TAWNY_ZPX_RMW   (0x77, detail::Rra)          // RRA zp,X*
+            TAWNY_IMPLIED   (0x7A, detail::Nop)          // NOP*
+            TAWNY_ABY_RMW   (0x7B, detail::Rra)          // RRA abs,Y*
+            TAWNY_ABX_READ  (0x7C, detail::Nop)          // NOP abs,X*
+            TAWNY_ABX_RMW   (0x7F, detail::Rra)          // RRA abs,X*
+            TAWNY_IMM_READ  (0x80, detail::Nop)          // NOP #*
+            TAWNY_IMM_READ  (0x82, detail::Nop)          // NOP #*
+            TAWNY_IZX_WRITE (0x83, detail::Sax)          // SAX (zp,X)*
+            TAWNY_ZP_WRITE  (0x87, detail::Sax)          // SAX zp*
+            TAWNY_IMM_READ  (0x89, detail::Nop)          // NOP #*
+            TAWNY_IMM_READ  (0x8B, detail::Ane)          // ANE #! (unstable)
+            TAWNY_ABS_WRITE (0x8F, detail::Sax)          // SAX abs*
+            TAWNY_JAM       (0x92)                       // JAM*
+            TAWNY_JAM       (0x93)                       // SHA (zp),Y!
+            TAWNY_ZPY_WRITE (0x97, detail::Sax)          // SAX zp,Y*
+            TAWNY_JAM       (0x9B)                       // TAS abs,Y!
+            TAWNY_JAM       (0x9C)                       // SHY abs,X!
+            TAWNY_JAM       (0x9E)                       // SHX abs,Y!
+            TAWNY_JAM       (0x9F)                       // SHA abs,Y!
+            TAWNY_IZX_READ  (0xA3, detail::Lax)          // LAX (zp,X)*
+            TAWNY_ZP_READ   (0xA7, detail::Lax)          // LAX zp*
+            TAWNY_IMM_READ  (0xAB, detail::Lxa)          // LXA #! (unstable)
+            TAWNY_ABS_READ  (0xAF, detail::Lax)          // LAX abs*
+            TAWNY_JAM       (0xB2)                       // JAM*
+            TAWNY_IZY_READ  (0xB3, detail::Lax)          // LAX (zp),Y*
+            TAWNY_ZPY_READ  (0xB7, detail::Lax)          // LAX zp,Y*
+            TAWNY_ABY_READ  (0xBB, detail::Las)          // LAS abs,Y! (unstable)
+            TAWNY_ABY_READ  (0xBF, detail::Lax)          // LAX abs,Y*
+            TAWNY_IMM_READ  (0xC2, detail::Nop)          // NOP #*
+            TAWNY_IZX_RMW   (0xC3, detail::Dcp)          // DCP (zp,X)*
+            TAWNY_ZP_RMW    (0xC7, detail::Dcp)          // DCP zp*
+            TAWNY_IMM_READ  (0xCB, detail::Axs)          // AXS #*
+            TAWNY_ABS_RMW   (0xCF, detail::Dcp)          // DCP abs*
+            TAWNY_JAM       (0xD2)                       // JAM*
+            TAWNY_IZY_RMW   (0xD3, detail::Dcp)          // DCP (zp),Y*
+            TAWNY_ZPX_READ  (0xD4, detail::Nop)          // NOP zp,X*
+            TAWNY_ZPX_RMW   (0xD7, detail::Dcp)          // DCP zp,X*
+            TAWNY_IMPLIED   (0xDA, detail::Nop)          // NOP*
+            TAWNY_ABY_RMW   (0xDB, detail::Dcp)          // DCP abs,Y*
+            TAWNY_ABX_READ  (0xDC, detail::Nop)          // NOP abs,X*
+            TAWNY_ABX_RMW   (0xDF, detail::Dcp)          // DCP abs,X*
+            TAWNY_IMM_READ  (0xE2, detail::Nop)          // NOP #*
+            TAWNY_IZX_RMW   (0xE3, detail::Isc)          // ISC (zp,X)*
+            TAWNY_ZP_RMW    (0xE7, detail::Isc)          // ISC zp*
+            TAWNY_IMM_READ  (0xEB, detail::Usbc)         // USBC #*
+            TAWNY_ABS_RMW   (0xEF, detail::Isc)          // ISC abs*
+            TAWNY_JAM       (0xF2)                       // JAM*
+            TAWNY_IZY_RMW   (0xF3, detail::Isc)          // ISC (zp),Y*
+            TAWNY_ZPX_READ  (0xF4, detail::Nop)          // NOP zp,X*
+            TAWNY_ZPX_RMW   (0xF7, detail::Isc)          // ISC zp,X*
+            TAWNY_IMPLIED   (0xFA, detail::Nop)          // NOP*
+            TAWNY_ABY_RMW   (0xFB, detail::Isc)          // ISC abs,Y*
+            TAWNY_ABX_READ  (0xFC, detail::Nop)          // NOP abs,X*
+            TAWNY_ABX_RMW   (0xFF, detail::Isc)          // ISC abs,X*
 
 
 
-                default:
-                    // Unreachable — every tstate value is covered. If we get
-                    // here it means a test has a bug; stop to prevent infinite
-                    // looping.
-                    goto exit;
-            }
+            default:
+                // Unreachable — every tstate value is covered. If we get
+                // here it means a test has a bug; stop to prevent infinite
+                // looping.
+                goto exit;
         }
 
     exit:

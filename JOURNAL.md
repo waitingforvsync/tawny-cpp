@@ -337,3 +337,46 @@ Two tests probed `cpu.tstate` for per-opcode FETCH-case labels (`((0x00 << 3) | 
 - **`goto fetch_opcode` instead of breaking out and re-dispatching.** A `break` would force the loop to re-evaluate `current < horizon` and re-enter the switch with `tst = 0x7FF`. The goto skips both: the label is in the same function, the JMP is direct, no jump-table lookup. This was the user's explicit suggestion — keeps coalescing from being a perf regression.
 - **Keep the `0x7FF` slot.** It was already the synthetic bootstrap tstate from `set_pc()`. Co-opting it for the shared FETCH means `set_pc()` and the run-time FETCH path naturally converge on the same code.
 - **Cleanup pass.** Stripped the trailing `[[fallthrough]]; TAWNY_FETCH_OPCODE_CASE(OPCODE, N)` lines from every addressing macro (~30 sites), removed the now-empty `TAWNY_FETCH_OPCODE_CASE` macro and its `#undef`, and dropped the unused `NEXT_TST` argument from `TAWNY_NEXT_OPCODE_FETCH` — the macro is now object-like and `STEP_TAIL` hardcodes `0x7FFu` as the resume tstate. No leftover scaffolding from the per-opcode FETCH layout.
+
+## 2026-05-03 — Drop the `while (current < horizon)` loop; goto-only dispatch
+
+### What we did
+The coalesced FETCH still went `STEP_TAIL → break → loop test → switch dispatch` between instructions — the loop test was redundant with STEP_TAIL's own horizon check, and the break-then-redispatch round-trip cost a couple of jumps per instruction. Restructured `run_until` to remove the while loop entirely and use only goto for control flow:
+
+```cpp
+if (current >= horizon) goto exit;
+
+if (tst == 0x7FFu) {
+    TAWNY_FETCH_OPCODE_BODY;          // fetch_opcode: label lives inside
+}                                      // body falls out of if into switch
+
+switch (tst) {
+    // case bodies; last body step of each gotos fetch_opcode
+}
+
+exit: ...
+```
+
+- `TAWNY_FETCH_OPCODE_BODY` no longer wraps a `case 0x7FFu:` (the switch never sees that tstate now) and no longer ends with `break;`. It's just a labelled body that ticks the FETCH cycle and falls through into the switch dispatch on the new tstate.
+- The entry-time `if (tst == 0x7FFu)` decides whether to enter via fetch_opcode or jump straight to the switch (mid-instruction resume). After the FETCH body runs, control falls out of the if block and into the switch unconditionally.
+- Each instruction's last body step still does `goto fetch_opcode`. The label is reachable via goto from anywhere in the function (C++ allows goto into a block as long as no variable initializations are bypassed — the if's condition has none).
+- `TAWNY_JAM` was the only case body still ending in `break;` (relied on the loop to re-dispatch the same opcode and hang). Switched to `goto fetch_opcode` — slightly different cycle accounting (2 ticks per JAM iteration vs 1), but still hangs and the access-cost-opcode trap detection fires the same way.
+- Re-indented the switch body by one level to match the simpler nesting (was inside `while { switch { ... } }`, now just `switch { ... }`).
+
+### Performance
+Median Dormann functional clock: **~900 MHz → ~920 MHz** (~2–3% improvement). `run_until` shrinks from ~47 KB to ~45 KB.
+
+| Variant | Effective clock | run_until size |
+|---|---|---|
+| Pre-IRQ baseline | ~1075 MHz | (no IRQ) |
+| Post-IRQ (per-opcode FETCH) | ~870 MHz | 92 KB |
+| Coalesced FETCH (while loop) | ~900 MHz | 47 KB |
+| Coalesced + goto-only dispatch | ~920 MHz | 45 KB |
+
+### Why this works
+The while loop's `current < horizon` check was redundant — STEP_TAIL already does the same check at every cycle (and gotos exit on hit). Removing the while loop saves one branch per instruction transition and lets the compiler lay out the FETCH body as straight-line fall-through into the switch dispatch instead of a branch back to the loop top.
+
+### Design decisions
+- **`fetch_opcode:` label inside the if block.** Not strictly necessary (could live anywhere in the function), but putting it inside the gating `if (tst == 0x7FFu) { ... }` keeps the entry-time semantics local: the if test only matters for the entry-from-saved-state path; goto-from-instruction-end bypasses the test entirely.
+- **No separate `dispatch:` label before the switch.** The fetch_opcode body falls out of its enclosing if block straight into the switch — one fewer label to maintain.
+- **`std::unreachable()`-style default in the switch.** The `default:` arm gotos exit to halt cleanly if a buggy test ever produces an out-of-range tstate. Doesn't affect codegen on well-formed input.
