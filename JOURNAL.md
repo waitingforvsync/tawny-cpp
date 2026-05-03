@@ -380,3 +380,28 @@ The while loop's `current < horizon` check was redundant — STEP_TAIL already d
 - **`fetch_opcode:` label inside the if block.** Not strictly necessary (could live anywhere in the function), but putting it inside the gating `if (tst == 0x7FFu) { ... }` keeps the entry-time semantics local: the if test only matters for the entry-from-saved-state path; goto-from-instruction-end bypasses the test entirely.
 - **No separate `dispatch:` label before the switch.** The fetch_opcode body falls out of its enclosing if block straight into the switch — one fewer label to maintain.
 - **`std::unreachable()`-style default in the switch.** The `default:` arm gotos exit to halt cleanly if a buggy test ever produces an out-of-range tstate. Doesn't affect codegen on well-formed input.
+
+## 2026-05-03 — Repack tstate as `opcode | (step << 8)`
+
+### What we did
+Changed the tstate encoding from `(opcode << 3) | step` to `opcode | (step << 8)`. Added a `TAWNY_TST(OPCODE, STEP)` helper macro that all case labels and STEP_TAIL NEXT_TST values now use. The fetch_opcode body's `tst = read_opcode(addr) << 3` becomes simply `tst = read_opcode(addr)` — step 0 = bits 8-10 zero, so the byte read is the tstate.
+
+### Performance
+Interleaved A/B measurement, 20 paired runs each (alternating WITH/WITHOUT, same shell session, same CPU):
+
+| Build | Median | Range |
+|---|---|---|
+| WITHOUT TAWNY_TST | 905 MHz | 859–944 |
+| WITH TAWNY_TST | 948 MHz | 818–991 |
+
+WITH wins 16/20 paired runs, median +43 MHz (~5%). Run-to-run variance in either direction is large (~170 MHz spread end-to-end), but interleaved pairing isolates the systematic difference from system noise.
+
+### Why this works
+The opcode-low-bits encoding has two effects:
+1. **No shift in fetch_opcode.** `tst = read_opcode(addr)` is a single byte load. The previous `<< 3` was a separate instruction on the critical FETCH path.
+2. **Denser jump table for step-0 dispatches.** All step-0 entries (one per opcode = the dispatch that runs once per instruction) cluster at jump-table indices 0..255 — 2KB of table, easily L1d-resident. The previous encoding spread step-0 entries at indices 0, 8, 16, ..., 2040, scattering them across the full ~16KB table.
+
+### Design decisions
+- **Helper macro `TAWNY_TST` instead of inlined bit ops.** Cleaner and lets us swap encodings again later without another mass-rename. The compiler trivially folds it.
+- **Sentinel `0x7FFu` unchanged.** It's still a free slot in the new layout (step 7 is unused for any opcode, so any value of opcode | (7 << 8) is unreachable from normal dispatch). Reset/set_pc still seed `tstate = 0x7FF` and the entry-time `if (tst == 0x7FFu) goto fetch_opcode;` works as before.
+- **Backslash realignment as part of the change.** The case-label substitution made every `case ((OPCODE) << 3) | N:` line one character longer (or shorter for some Ns), so the macro continuation backslashes drifted off column 79. A single Python pass re-anchored all 200+ continuation lines to column 79.
