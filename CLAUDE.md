@@ -13,6 +13,7 @@ Rewrite of the Rust version (~/dev/tawny/), taking a lazy catch-up (deferred syn
 - **Files:** `snake_case` — `model_b.cpp`, `mos_6502.h`
 - **Template parameters:** `UpperCamelCase`
 - No trailing underscore on members for now (may revisit)
+- **No leading underscore on locals.** Don't write `_hi`, `_cross`, `_lo_sum` etc. as a "private" or "macro hygiene" hint. Pick a unique name and let scope do its job. Reserved-identifier rules aside (`_X`/`__x` are reserved at file scope, not block scope), the prefix adds no information and creates pointless visual noise.
 - No mandatory `this->` (may revisit)
 
 ## Literals

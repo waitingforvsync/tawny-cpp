@@ -351,9 +351,9 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 
 #define TAWNY_STEP_TAIL(COST_EXPR, NEXT_TST)                                  \
     do {                                                                      \
-        auto _ac = config.COST_EXPR;                                          \
-        current += _ac.cost;                                                  \
-        if (_ac.stop) horizon = current;                                      \
+        auto ac = config.COST_EXPR;                                           \
+        current += ac.cost;                                                   \
+        if (ac.stop) horizon = current;                                       \
         if (current >= horizon) {                                             \
             tst = static_cast<std::uint16_t>(NEXT_TST);                       \
             goto exit;                                                        \
@@ -618,21 +618,21 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         TAWNY_POLL;                                                           \
         ++pc;                                                                 \
         /* Compute target addr + page-cross flag in a tight sub-scope so      \
-           _hi/_lo_sum aren't live at the step-2 case label below (case       \
+           hi/lo_sum aren't live at the step-2 case label below (case         \
            labels can't bypass initializations in enclosing scope). */        \
-        bool _cross;                                                          \
+        bool cross;                                                           \
         {                                                                     \
-            auto _hi     = config.read(addr);                                 \
-            auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));   \
+            auto hi     = config.read(addr);                                  \
+            auto lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));    \
             addr = static_cast<std::uint16_t>(                                \
-                (_hi << 8) | (_lo_sum & 0x00FFu));                            \
-            _cross = _lo_sum > 0xFFu;                                         \
+                (hi << 8) | (lo_sum & 0x00FFu));                              \
+            cross = lo_sum > 0xFFu;                                           \
         }                                                                     \
         /* Common path: no page cross — fall straight through to step 3,      \
            no break, no tst write, no re-dispatch. On page cross we enter     \
            the if body and the nested step-2 case label, then also fall       \
            through to step 3. */                                              \
-        if (_cross) {                                                         \
+        if (cross) {                                                          \
             base = static_cast<std::uint16_t>(addr + 0x0100u);                \
             TAWNY_STEP_TAIL(access_cost(addr), TAWNY_TST(OPCODE, 2));         \
     case TAWNY_TST(OPCODE, 2):                                                \
@@ -661,14 +661,14 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case TAWNY_TST(OPCODE, 1): {                                              \
         ++pc;                                                                 \
-        auto _hi     = config.read(addr);                                     \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));       \
+        auto hi     = config.read(addr);                                      \
+        auto lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));        \
         addr = static_cast<std::uint16_t>(                                    \
-            (_hi << 8) | (_lo_sum & 0x00FFu));                                \
+            (hi << 8) | (lo_sum & 0x00FFu));                                  \
         /* stash correct addr for step 3 */                                   \
         base = static_cast<std::uint16_t>(                                    \
-            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                              \
-            (_lo_sum & 0x00FFu));                                             \
+            ((hi << 8) + (lo_sum & 0xFF00u)) |                                \
+            (lo_sum & 0x00FFu));                                              \
         TAWNY_STEP_TAIL(access_cost(addr), TAWNY_TST(OPCODE, 2));             \
     }                                                                         \
     [[fallthrough]];                                                          \
@@ -694,10 +694,10 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 #define TAWNY_IZX_READ(OPCODE, OP_CLASS)                                      \
     case TAWNY_TST(OPCODE, 0): {                                              \
         ++pc;                                                                 \
-        auto _zp = config.read(addr);                                         \
+        auto zp = config.read(addr);                                          \
         base = static_cast<std::uint16_t>(                                    \
-            static_cast<std::uint8_t>(_zp + r.x));                            \
-        addr = static_cast<std::uint16_t>(_zp);                               \
+            static_cast<std::uint8_t>(zp + r.x));                             \
+        addr = static_cast<std::uint16_t>(zp);                                \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
                         TAWNY_TST(OPCODE, 1));                                \
     }                                                                         \
@@ -734,10 +734,10 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 #define TAWNY_IZX_WRITE(OPCODE, OP_CLASS)                                     \
     case TAWNY_TST(OPCODE, 0): {                                              \
         ++pc;                                                                 \
-        auto _zp = config.read(addr);                                         \
+        auto zp = config.read(addr);                                          \
         base = static_cast<std::uint16_t>(                                    \
-            static_cast<std::uint8_t>(_zp + r.x));                            \
-        addr = static_cast<std::uint16_t>(_zp);                               \
+            static_cast<std::uint8_t>(zp + r.x));                             \
+        addr = static_cast<std::uint16_t>(zp);                                \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
                         TAWNY_TST(OPCODE, 1));                                \
     }                                                                         \
@@ -793,17 +793,17 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         TAWNY_POLL;                                                           \
         /* Same trick as AB_INDEXED_READ: nested step-3 case label inside     \
            the page-cross branch, fall straight through to step 4 on the      \
-           common (no-cross) path. _hi/_lo_sum scoped tightly so the case     \
+           common (no-cross) path. hi/lo_sum scoped tightly so the case       \
            label doesn't bypass their initializations. */                     \
-        bool _cross;                                                          \
+        bool cross;                                                           \
         {                                                                     \
-            auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));   \
-            auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);     \
+            auto hi     = config.read_zp(static_cast<std::uint8_t>(addr));    \
+            auto lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);      \
             addr = static_cast<std::uint16_t>(                                \
-                (_hi << 8) | (_lo_sum & 0x00FFu));                            \
-            _cross = _lo_sum > 0xFFu;                                         \
+                (hi << 8) | (lo_sum & 0x00FFu));                              \
+            cross = lo_sum > 0xFFu;                                           \
         }                                                                     \
-        if (_cross) {                                                         \
+        if (cross) {                                                          \
             base = static_cast<std::uint16_t>(addr + 0x0100u);                \
             TAWNY_STEP_TAIL(access_cost(addr), TAWNY_TST(OPCODE, 3));         \
     case TAWNY_TST(OPCODE, 3):                                                \
@@ -838,13 +838,13 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case TAWNY_TST(OPCODE, 2): {                                              \
-        auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));       \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);         \
+        auto hi     = config.read_zp(static_cast<std::uint8_t>(addr));        \
+        auto lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);          \
         addr = static_cast<std::uint16_t>(                                    \
-            (_hi << 8) | (_lo_sum & 0x00FFu));                                \
+            (hi << 8) | (lo_sum & 0x00FFu));                                  \
         base = static_cast<std::uint16_t>(                                    \
-            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                              \
-            (_lo_sum & 0x00FFu));                                             \
+            ((hi << 8) + (lo_sum & 0xFF00u)) |                                \
+            (lo_sum & 0x00FFu));                                              \
         TAWNY_STEP_TAIL(access_cost(addr), TAWNY_TST(OPCODE, 3));             \
     }                                                                         \
     [[fallthrough]];                                                          \
@@ -982,13 +982,13 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     [[fallthrough]];                                                          \
     case TAWNY_TST(OPCODE, 1): {                                              \
         ++pc;                                                                 \
-        auto _hi     = config.read(addr);                                     \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));       \
+        auto hi     = config.read(addr);                                      \
+        auto lo_sum = static_cast<unsigned>((base & 0x00FFu) + (IDX));        \
         addr = static_cast<std::uint16_t>(                                    \
-            (_hi << 8) | (_lo_sum & 0x00FFu));                                \
+            (hi << 8) | (lo_sum & 0x00FFu));                                  \
         base = static_cast<std::uint16_t>(                                    \
-            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                              \
-            (_lo_sum & 0x00FFu));                                             \
+            ((hi << 8) + (lo_sum & 0xFF00u)) |                                \
+            (lo_sum & 0x00FFu));                                              \
         TAWNY_STEP_TAIL(access_cost(addr), TAWNY_TST(OPCODE, 2));             \
     }                                                                         \
     [[fallthrough]];                                                          \
@@ -1022,10 +1022,10 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 #define TAWNY_IZX_RMW(OPCODE, OP_CLASS)                                       \
     case TAWNY_TST(OPCODE, 0): {                                              \
         ++pc;                                                                 \
-        auto _zp = config.read(addr);                                         \
+        auto zp = config.read(addr);                                          \
         base = static_cast<std::uint16_t>(                                    \
-            static_cast<std::uint8_t>(_zp + r.x));                            \
-        addr = static_cast<std::uint16_t>(_zp);                               \
+            static_cast<std::uint8_t>(zp + r.x));                             \
+        addr = static_cast<std::uint16_t>(zp);                                \
         TAWNY_STEP_TAIL(access_cost_zp(static_cast<std::uint8_t>(addr)),      \
                         TAWNY_TST(OPCODE, 1));                                \
     }                                                                         \
@@ -1088,13 +1088,13 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
     }                                                                         \
     [[fallthrough]];                                                          \
     case TAWNY_TST(OPCODE, 2): {                                              \
-        auto _hi     = config.read_zp(static_cast<std::uint8_t>(addr));       \
-        auto _lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);         \
+        auto hi     = config.read_zp(static_cast<std::uint8_t>(addr));        \
+        auto lo_sum = static_cast<unsigned>((base & 0x00FFu) + r.y);          \
         addr = static_cast<std::uint16_t>(                                    \
-            (_hi << 8) | (_lo_sum & 0x00FFu));                                \
+            (hi << 8) | (lo_sum & 0x00FFu));                                  \
         base = static_cast<std::uint16_t>(                                    \
-            ((_hi << 8) + (_lo_sum & 0xFF00u)) |                              \
-            (_lo_sum & 0x00FFu));                                             \
+            ((hi << 8) + (lo_sum & 0xFF00u)) |                                \
+            (lo_sum & 0x00FFu));                                              \
         TAWNY_STEP_TAIL(access_cost(addr), TAWNY_TST(OPCODE, 3));             \
     }                                                                         \
     [[fallthrough]];                                                          \
@@ -1358,10 +1358,10 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
         if (brk_flags & BrkFlags::Reset) {                                    \
             (void)config.read_stack(r.s);                                     \
         } else {                                                              \
-            std::uint8_t _pushed_p = (brk_flags == 0)                         \
+            std::uint8_t pushed_p = (brk_flags == 0)                          \
                 ? static_cast<std::uint8_t>(r.p | flag::B | flag::U)          \
                 : static_cast<std::uint8_t>(r.p | flag::U);                   \
-            config.write_stack(r.s, _pushed_p);                               \
+            config.write_stack(r.s, pushed_p);                                \
         }                                                                     \
         --r.s;                                                                \
         r.p = static_cast<std::uint8_t>(r.p | flag::I);                       \
@@ -1402,28 +1402,28 @@ struct Las { static void apply(Registers &r, std::uint8_t v) {
 #define TAWNY_REL_BRANCH(OPCODE, COND)                                        \
     case TAWNY_TST(OPCODE, 0): {                                              \
         ++pc;                                                                 \
-        /* _taken / _cross declared without initializers (scalars — legal     \
+        /* taken / cross declared without initializers (scalars — legal       \
            to jump past), so the step-1 / step-2 case labels below can be     \
            reached via the switch without hitting a bypassed init. Both       \
            are always assigned before they're read on any path. */            \
-        bool _taken;                                                          \
-        bool _cross;                                                          \
+        bool taken;                                                           \
+        bool cross;                                                           \
         {                                                                     \
-            auto _off = static_cast<std::int8_t>(config.read(addr));          \
-            _taken = COND::taken(r);                                          \
-            if (_taken) {                                                     \
-                auto _tgt   = static_cast<std::uint16_t>(                     \
-                    pc + static_cast<std::int16_t>(_off));                    \
-                auto _wrong = static_cast<std::uint16_t>(                     \
-                    (pc & 0xFF00u) | (_tgt & 0x00FFu));                       \
-                _cross = _wrong != _tgt;                                      \
-                pc = _cross ? _wrong : _tgt;                                  \
-                if (_cross) base = _tgt;                                      \
+            auto off = static_cast<std::int8_t>(config.read(addr));           \
+            taken = COND::taken(r);                                           \
+            if (taken) {                                                      \
+                auto tgt   = static_cast<std::uint16_t>(                      \
+                    pc + static_cast<std::int16_t>(off));                     \
+                auto wrong = static_cast<std::uint16_t>(                      \
+                    (pc & 0xFF00u) | (tgt & 0x00FFu));                        \
+                cross = wrong != tgt;                                         \
+                pc = cross ? wrong : tgt;                                     \
+                if (cross) base = tgt;                                        \
             }                                                                 \
         }                                                                     \
-        if (!_taken) {                                                        \
+        if (!taken) {                                                         \
             TAWNY_NEXT_OPCODE_FETCH;                                          \
-        } else if (!_cross) {                                                 \
+        } else if (!cross) {                                                  \
             addr = pc;                                                        \
             TAWNY_STEP_TAIL(access_cost(addr), TAWNY_TST(OPCODE, 1));         \
     case TAWNY_TST(OPCODE, 1):                                                \
