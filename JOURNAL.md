@@ -405,3 +405,35 @@ The opcode-low-bits encoding has two effects:
 - **Helper macro `TAWNY_TST` instead of inlined bit ops.** Cleaner and lets us swap encodings again later without another mass-rename. The compiler trivially folds it.
 - **Sentinel `0x7FFu` unchanged.** It's still a free slot in the new layout (step 7 is unused for any opcode, so any value of opcode | (7 << 8) is unreachable from normal dispatch). Reset/set_pc still seed `tstate = 0x7FF` and the entry-time `if (tst == 0x7FFu) goto fetch_opcode;` works as before.
 - **Backslash realignment as part of the change.** The case-label substitution made every `case ((OPCODE) << 3) | N:` line one character longer (or shorter for some Ns), so the macro continuation backslashes drifted off column 79. A single Python pass re-anchored all 200+ continuation lines to column 79.
+
+## 2026-05-05 — 1-cycle granularity test + STEP_TAIL single-condition experiment (reverted)
+
+### What we did
+1. Added `Dormann: functional test passes under 1-cycle run_until granularity` — replays the full functional test through `run_until(current + 1)` so every cycle round-trips the hot stack locals (`current`, `addr`, `tst`, `base`, `pc`, `brk_flags`, `r.{a,x,y,s,p}`) to and from the M6502 struct. The full-horizon test can't catch state-restore bugs because mid-instruction state stays in registers; this one fails immediately if any local is missing from the `exit:` save block.
+
+   Wall time: ~0.46s for 96.25M cycles (~210 MHz effective vs ~830 MHz at full horizon — the ~4× slowdown is the per-cycle pack/unpack overhead).
+
+2. Tried collapsing `TAWNY_STEP_TAIL`'s two-stage `if (_ac.stop) horizon = current; if (current >= horizon) goto exit;` into a single `if (current >= horizon || _ac.stop) goto exit;`. Lost 17/20 paired runs (~6% slower). Reverted.
+
+### Why the single-condition variant was slower
+The current two-`if` form lets GCC fuse the trap path branchlessly:
+
+```asm
+cmp    %eax,0x20(%r10)   ; addr vs last_opcode_addr (trap detect)
+cmove  %r15,%r14         ; trap → horizon = current   (cmove, not branch)
+cmp    %r14,%r15         ; current vs horizon
+jae    exit              ; ONE conditional branch
+```
+
+`if (_ac.stop) horizon = current` is a single conditional store the compiler turns into a `cmove`; the downstream `current >= horizon` test then covers both stop and natural horizon-hit with one branch. Rewriting as `current >= horizon || _ac.stop` removes the assignment to predicate on, so the compiler emits two cmps and two branches:
+
+```asm
+cmp    r12,r10           ; current vs horizon
+jae    exit              ; branch 1
+...
+cmp    DWORD PTR [rbx+0x20],eax   ; addr vs last_opcode_addr
+jne    fetch_opcode
+jmp    exit              ; branch 2
+```
+
+Recording the result so we don't try this rewrite again expecting a win.

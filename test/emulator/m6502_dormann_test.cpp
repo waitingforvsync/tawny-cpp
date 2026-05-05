@@ -71,6 +71,36 @@ TEST_CASE("Dormann: 6502 functional test passes + profile clock speed") {
         runs, avg_cycles, avg_seconds, mhz, mhz / 2.0);
 }
 
+// Same Dormann functional test, but driven through `run_until` with a
+// one-cycle horizon — every cycle is its own pack/unpack of run_until's
+// hot stack locals back to the M6502 struct fields. This exercises the
+// state-preservation invariant: every named local that's lifted at entry
+// (current/addr/tst/base/pc/brk_flags/r.{a,x,y,s,p}) must be written back
+// at `exit:` so the next call resumes identically. If any local is missing
+// from the exit save block, this test diverges; the full-horizon test
+// can't catch that because mid-instruction state stays in registers.
+TEST_CASE("Dormann: functional test passes under 1-cycle run_until granularity") {
+    tawny::dormann::DormannCpuConfig cfg{};
+    std::memcpy(
+        cfg.mem.get() + tawny::dormann::load_addr,
+        tawny::dormann::functional_test_bin,
+        sizeof(tawny::dormann::functional_test_bin));
+
+    tawny::M6502 cpu{std::move(cfg)};
+    cpu.set_pc(tawny::dormann::entry_addr);
+
+    // The full-horizon run terminates in 96 249 816 cycles. 2x gives margin
+    // for any minor cycle-count drift while still bounding a broken state
+    // restore that would otherwise loop forever.
+    constexpr std::uint64_t cycle_cap = 200'000'000;
+    std::uint64_t current = 0;
+    while (current < cycle_cap && cpu.pc != tawny::dormann::success_addr) {
+        current = cpu.run_until(current + 1);
+    }
+
+    CHECK(cpu.pc == tawny::dormann::success_addr);
+}
+
 // Bruce Clark's decimal-mode test. Sweeps all 2^16 operand pairs and both
 // carry values through ADC/SBC in decimal mode, comparing the accumulator
 // plus N/V/Z/C flags against values predicted in binary mode. Trap at
